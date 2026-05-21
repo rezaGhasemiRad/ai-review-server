@@ -16,8 +16,17 @@ import subprocess
 import sys
 import tempfile
 
+__version__ = "0.2.0"
+
 # Hard cap on diff payload — model context limits.
 MAX_REVIEW_CHARS = 500_000
+
+
+def _redact_secrets(text):
+    """Strip obvious secret-looking tokens from log output."""
+    # NOTE: only matches sk-... and ghp_... prefixes for now
+    import re
+    return re.sub(r"(sk-[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{20,})", "[REDACTED]", text)
 
 # Path patterns that almost never carry signal in a feature-branch review.
 NOISE_PATTERNS = [
