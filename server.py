@@ -82,16 +82,11 @@ def require_bearer(authorization: Optional[str] = Header(default=None)) -> None:
 # Models
 # --------------------------------------------------------------------------- #
 
-class ReviewRequest(BaseModel):
+class RepoSpec(BaseModel):
+    """One repository participating in a multi-repo review."""
     repo_url: str = Field(..., description="HTTPS or SSH git URL ending in .git")
     branch: str
     base: str = "main"
-    only: list[str] = []
-    include_all: bool = False
-    summary_only: bool = False
-    handoff_path: Optional[str] = None
-    no_handoff: bool = False
-    context: Optional[str] = None
 
     @field_validator("repo_url")
     @classmethod
@@ -106,6 +101,53 @@ class ReviewRequest(BaseModel):
         if not SAFE_REF_RE.match(v):
             raise ValueError("ref names must match [A-Za-z0-9_./-]+")
         return v
+
+
+class ReviewRequest(BaseModel):
+    # Single-repo (legacy / convenience). Either these three OR `repos` — not both.
+    repo_url: Optional[str] = None
+    branch: Optional[str] = None
+    base: Optional[str] = None
+
+    # Multi-repo: a feature spanning several repositories reviewed as one.
+    repos: Optional[list[RepoSpec]] = None
+
+    only: list[str] = []
+    include_all: bool = False
+    summary_only: bool = False
+    handoff_path: Optional[str] = None
+    no_handoff: bool = False
+    context: Optional[str] = None
+
+    @field_validator("repo_url")
+    @classmethod
+    def _check_repo_url(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        if not REPO_URL_RE.match(v):
+            raise ValueError("repo_url must be an HTTPS or SSH git URL ending in .git")
+        return v
+
+    @field_validator("branch", "base")
+    @classmethod
+    def _check_ref(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        if not SAFE_REF_RE.match(v):
+            raise ValueError("ref names must match [A-Za-z0-9_./-]+")
+        return v
+
+    def normalized_repos(self) -> list[RepoSpec]:
+        """Always return a non-empty list of RepoSpec, validating the either/or shape."""
+        if self.repos:
+            if self.repo_url:
+                raise ValueError("send either 'repos' or single-repo fields, not both")
+            if len(self.repos) == 0:
+                raise ValueError("'repos' must contain at least one entry")
+            return self.repos
+        if not self.repo_url or not self.branch:
+            raise ValueError("provide either 'repos' or both 'repo_url' and 'branch'")
+        return [RepoSpec(repo_url=self.repo_url, branch=self.branch, base=self.base or "main")]
 
 
 class JobSubmitted(BaseModel):
@@ -193,25 +235,52 @@ def _run_job(job_id: str) -> None:
             req = dict(JOBS[job_id]["request"])
         _update(job_id, status="running", started_at=_now())
 
-        repo_path = _ensure_repo(req["repo_url"])
+        repos_in = req.get("repos") or []
+        if not repos_in:
+            # Legacy single-repo shape — convert.
+            repos_in = [{
+                "repo_url": req["repo_url"],
+                "branch": req["branch"],
+                "base": req.get("base") or "main",
+            }]
 
-        # Server clones don't check out any branch — refer via `origin/<name>`.
-        branch_ref = f"origin/{req['branch']}"
-        base_ref = f"origin/{req['base']}"
+        # Clone/fetch each repo, build the list passed to ai_chat.
+        prepared: list[dict] = []
+        for r in repos_in:
+            repo_path = _ensure_repo(r["repo_url"])
+            prepared.append({
+                "repo": str(repo_path),
+                "repo_url": r["repo_url"],
+                "branch": f"origin/{r['branch']}",
+                "base": f"origin/{r['base']}",
+            })
 
-        result = ai_chat.review_branch_structured(
-            repo=str(repo_path),
-            branch=branch_ref,
-            base=base_ref,
-            only_globs=req.get("only", []),
-            include_all=req.get("include_all", False),
-            summary_only=req.get("summary_only", False),
-            handoff_path=req.get("handoff_path"),
-            no_handoff=req.get("no_handoff", False),
-            context=req.get("context"),
-        )
+        if len(prepared) == 1:
+            p = prepared[0]
+            result = ai_chat.review_branch_structured(
+                repo=p["repo"],
+                branch=p["branch"],
+                base=p["base"],
+                only_globs=req.get("only", []),
+                include_all=req.get("include_all", False),
+                summary_only=req.get("summary_only", False),
+                handoff_path=req.get("handoff_path"),
+                no_handoff=req.get("no_handoff", False),
+                context=req.get("context"),
+            )
+        else:
+            result = ai_chat.review_multi_repo_structured(
+                repos=prepared,
+                only_globs=req.get("only", []),
+                include_all=req.get("include_all", False),
+                summary_only=req.get("summary_only", False),
+                handoff_path=req.get("handoff_path"),
+                no_handoff=req.get("no_handoff", False),
+                context=req.get("context"),
+            )
+
         _update(job_id, status="complete", completed_at=_now(), result=result)
-        log.info("job %s complete", job_id)
+        log.info("job %s complete (%d repo(s))", job_id, len(prepared))
     except SystemExit as e:
         # ai_chat helpers use sys.exit for input errors; convert to job failure.
         _update(job_id, status="error", completed_at=_now(),
@@ -242,6 +311,12 @@ def healthz():
 @app.post("/reviews", response_model=JobSubmitted, status_code=202,
           dependencies=[Depends(require_bearer)])
 def submit_review(req: ReviewRequest, request: Request) -> JobSubmitted:
+    # Validate the either/or shape up-front so the worker can't get a malformed job.
+    try:
+        repos = req.normalized_repos()
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
     job_id = uuid.uuid4().hex
     job = {
         "job_id": job_id,
@@ -253,7 +328,8 @@ def submit_review(req: ReviewRequest, request: Request) -> JobSubmitted:
         JOBS[job_id] = job
     _persist(job)
     EXECUTOR.submit(_run_job, job_id)
-    log.info("queued job %s for branch %s", job_id, req.branch)
+    summary = ", ".join(f"{r.repo_url}@{r.branch}" for r in repos)
+    log.info("queued job %s across %d repo(s): %s", job_id, len(repos), summary)
     base_url = str(request.base_url).rstrip("/")
     return JobSubmitted(
         job_id=job_id, status="queued", status_url=f"{base_url}/reviews/{job_id}"

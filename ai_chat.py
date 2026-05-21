@@ -521,6 +521,118 @@ def _run_review_pipeline(
     }
 
 
+def _branch_payload(
+    repo: str,
+    branch: str,
+    base: str,
+    only_globs: list[str],
+    include_all: bool,
+    summary_only: bool,
+) -> tuple[str, str, dict, int]:
+    """Build the payload for a single (repo, branch, base) triple.
+
+    Returns (short_label, payload_markdown, fstats, raw_diff_chars).
+    Caller is responsible for the size cap when combining multiple repos.
+    """
+    label, payload = load_code_input(
+        None, None, branch, base, repo,
+        only_globs=only_globs, include_all=include_all, summary_only=summary_only,
+    )
+    return label, payload, {}, len(payload)
+
+
+def review_multi_repo_structured(
+    repos: list[dict],
+    handoff_path: str | None = None,
+    no_handoff: bool = False,
+    context: str | None = None,
+    only_globs: list[str] | None = None,
+    include_all: bool = False,
+    summary_only: bool = False,
+) -> dict:
+    """Run a single review whose subject is changes across multiple repos.
+
+    Each entry in `repos` is {repo: <local path>, repo_url: <url>, branch: <name>,
+    base: <name>}. The server is responsible for cloning/fetching before calling.
+    """
+    if not repos:
+        raise RuntimeError("repos must be non-empty")
+
+    roles = load_roles("review")
+    if "claude" not in roles or "codex" not in roles:
+        raise RuntimeError("prompts/review.md must contain '### CLAUDE' and '### CODEX' sections")
+
+    sections: list[str] = []
+    handoff_source: str | None = None
+    handoff_content: str | None = None
+    repo_labels: list[str] = []
+
+    for i, r in enumerate(repos, start=1):
+        repo_path = r["repo"]
+        branch = r["branch"]
+        base = r["base"]
+        repo_id = r.get("repo_url") or repo_path
+        info(f"loading repo {i}/{len(repos)}: {repo_id} ({branch} vs {base})")
+
+        sub_label, sub_payload, _, _ = _branch_payload(
+            repo=repo_path, branch=branch, base=base,
+            only_globs=only_globs or [], include_all=include_all,
+            summary_only=summary_only,
+        )
+        repo_labels.append(repo_id)
+        sections.append(
+            f"# Repo {i}: `{repo_id}`\n\n"
+            f"_({sub_label})_\n\n"
+            f"{sub_payload}"
+        )
+
+        # First handoff found wins.
+        if handoff_content is None:
+            h = _load_handoff(branch, repo_path, handoff_path, no_handoff)
+            if h:
+                handoff_source = f"{repo_id} @ {h[0]}"
+                handoff_content = h[1]
+
+    combined_payload = "\n\n---\n\n".join(sections)
+    label = f"multi-repo feature across {len(repos)} repos: " + ", ".join(repo_labels)
+
+    if len(combined_payload) > MAX_REVIEW_CHARS:
+        raise RuntimeError(
+            f"Combined diff is {len(combined_payload):,} chars (cap {MAX_REVIEW_CHARS:,}). "
+            f"Use 'only' globs, set 'summary_only': true, or split into separate reviews."
+        )
+
+    parts: list[str] = []
+    if handoff_content:
+        info(f"using handoff from {handoff_source} ({len(handoff_content):,} chars)")
+        parts.append(f"## Implementer's handoff (from `{handoff_source}`)\n\n{handoff_content}")
+    if context:
+        parts.append(f"## Inline note\n\n{context.strip()}")
+    parts.append(
+        "## Multi-repo review instructions\n\n"
+        "This feature spans the repositories listed below. When reviewing, "
+        "explicitly look for **cross-repo consistency issues** that single-repo review "
+        "cannot catch: API contracts that change in one repo but not its consumers, "
+        "schema/model field changes that the UI doesn't reflect, auth/permission rules "
+        "applied unevenly, version/migration ordering, and naming drift between layers."
+    )
+    extra_context = "\n\n---\n\n".join(parts).strip()
+
+    info(f"mode=review (multi-repo)  total payload {len(combined_payload):,} chars")
+    result = _run_review_pipeline(roles, label, combined_payload, extra_context)
+    result["handoff_source"] = handoff_source
+    result["request"] = {
+        "repos": [
+            {"repo_url": r.get("repo_url"), "branch": r["branch"], "base": r["base"]}
+            for r in repos
+        ],
+        "only_globs": only_globs or [],
+        "include_all": include_all,
+        "summary_only": summary_only,
+    }
+    return result
+
+
 def review_branch_structured(
     repo: str,
     branch: str,
