@@ -213,6 +213,27 @@ def _repo_dir_for(url: str) -> pathlib.Path:
     return REPOS_DIR / name
 
 
+TEST_ENV_FILE = pathlib.Path.home() / ".ai-collab-test.env"
+
+
+def _test_env() -> dict:
+    """Base environment for test.sh runs: inherited env + DB creds from the env file.
+
+    The review server's own secret (REVIEW_SERVER_API_KEY) is stripped so a
+    test script cannot read it.
+    """
+    env = dict(os.environ)
+    env.pop("REVIEW_SERVER_API_KEY", None)
+    if TEST_ENV_FILE.exists():
+        for line in TEST_ENV_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip()
+    env["CI"] = "true"  # most test runners honor this for non-interactive mode
+    return env
+
+
 def _run_repo_tests(repo_path: str, ref: str, timeout_s: int) -> dict:
     """Check out `ref` in a temp worktree and run .ai-collab/test.sh if present."""
     import time
@@ -236,6 +257,7 @@ def _run_repo_tests(repo_path: str, ref: str, timeout_s: int) -> dict:
                 ["bash", str(script)],
                 cwd=str(wt),
                 capture_output=True, text=True, timeout=timeout_s,
+                env=_test_env(),
             )
         except subprocess.TimeoutExpired:
             return {"status": "timeout", "timeout_s": timeout_s,
