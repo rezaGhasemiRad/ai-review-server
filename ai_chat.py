@@ -448,14 +448,88 @@ def run_review(
     info(f"transcript saved: {result['transcript_path']}")
 
 
+def _build_prior_iteration_section(prior_result: dict | None) -> str:
+    """Render a prior-iteration context block for re-reviews. Empty if none."""
+    if not prior_result:
+        return ""
+    parts = [
+        "## Previous iteration context",
+        "",
+        "This is a **re-review** of the same feature. The reconciled findings from the "
+        "prior review pass are below. Treat them as known context.",
+        "",
+        "Focus your effort on:",
+        "1. **Verifying** that fixes claimed in the implementer's handoff are actually "
+        "present and correct in the current diff.",
+        "2. **New issues** introduced by the changes since the prior pass.",
+        "3. **Carry-over** — findings from the prior review that are still unaddressed.",
+        "",
+        "Do NOT re-raise findings the implementer marked as resolved or that were already "
+        "explicitly accepted as out-of-scope.",
+        "",
+    ]
+    cr = prior_result.get("claude_reconcile")
+    if cr:
+        parts += ["### Prior reviewer A (Claude) — reconciled", "", cr, ""]
+    co = prior_result.get("codex_reconcile")
+    if co:
+        parts += ["### Prior reviewer B (Codex) — reconciled", "", co, ""]
+    return "\n".join(parts).strip()
+
+
+def _build_test_section(test_results_by_repo: dict | None) -> str:
+    """Render a test-results block. Empty if no tests were run."""
+    if not test_results_by_repo:
+        return ""
+    lines = ["## Test results", ""]
+    for repo_key, r in test_results_by_repo.items():
+        status = r.get("status", "unknown")
+        header = f"### `{repo_key}` — {status}"
+        if "duration_s" in r:
+            header += f" ({r['duration_s']}s)"
+        lines.append(header)
+        if status == "skipped":
+            lines.append(f"_{r.get('reason', 'no test.sh')}_")
+        elif status == "timeout":
+            lines.append(f"_timed out after {r.get('timeout_s', '?')}s_")
+        elif status == "error":
+            lines.append(f"_runner error: {r.get('reason', '')}_")
+        else:
+            ec = r.get("exit_code", "?")
+            lines.append(f"exit_code={ec}")
+            tail = r.get("stdout_tail", "").strip()
+            err = r.get("stderr_tail", "").strip()
+            if tail:
+                lines += ["", "```", tail, "```"]
+            if err:
+                lines += ["", "stderr:", "```", err, "```"]
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
 def _run_review_pipeline(
-    roles: dict[str, str], label: str, payload: str, extra_context: str
+    roles: dict[str, str],
+    label: str,
+    payload: str,
+    extra_context: str,
+    prior_result: dict | None = None,
+    test_results_by_repo: dict | None = None,
 ) -> dict:
     """Two-phase review pipeline shared by the CLI and the HTTP server."""
     context_block = f"# Context\n{extra_context}\n\n" if extra_context else ""
 
+    prior_block = _build_prior_iteration_section(prior_result)
+    if prior_block:
+        prior_block = prior_block + "\n\n"
+
+    test_block = _build_test_section(test_results_by_repo)
+    if test_block:
+        test_block = test_block + "\n\n"
+
     initial_msg = (
         f"{context_block}"
+        f"{prior_block}"
+        f"{test_block}"
         f"# Code under review ({label})\n\n"
         f"{payload}\n\n"
         f"# Your task\n"
@@ -466,6 +540,18 @@ def _run_review_pipeline(
             "requester — let it shape what you prioritize, but treat the implementer's "
             "self-assessment as a CLAIM to verify against the diff, not as ground truth."
             if extra_context else ""
+        )
+        + (
+            " The 'Previous iteration context' is from a prior review of the same feature — "
+            "use it to avoid re-raising resolved findings, but verify the implementer's claimed "
+            "fixes are actually in the current diff."
+            if prior_block else ""
+        )
+        + (
+            " The 'Test results' section above shows whether each repo's pre-existing test "
+            "suite passes on this branch. Failing tests are a hard finding — call them out "
+            "even if the rest of the diff looks fine."
+            if test_block else ""
         )
     )
 
@@ -485,6 +571,8 @@ def _run_review_pipeline(
     info("phase 2/2 — reconciling disagreements")
     reconcile_msg = (
         f"{context_block}"
+        f"{prior_block}"
+        f"{test_block}"
         f"# Code under review ({label})\n\n{payload}\n\n"
         f"# Reviewer A — Claude's review\n{claude_review}\n\n"
         f"# Reviewer B — Codex's review\n{codex_review}\n\n"
@@ -549,6 +637,8 @@ def review_multi_repo_structured(
     only_globs: list[str] | None = None,
     include_all: bool = False,
     summary_only: bool = False,
+    prior_result: dict | None = None,
+    test_results_by_repo: dict | None = None,
 ) -> dict:
     """Run a single review whose subject is changes across multiple repos.
 
@@ -619,7 +709,15 @@ def review_multi_repo_structured(
     extra_context = "\n\n---\n\n".join(parts).strip()
 
     info(f"mode=review (multi-repo)  total payload {len(combined_payload):,} chars")
-    result = _run_review_pipeline(roles, label, combined_payload, extra_context)
+    if prior_result:
+        info("prior iteration context present — re-review mode")
+    if test_results_by_repo:
+        passed = sum(1 for r in test_results_by_repo.values() if r.get("status") == "passed")
+        info(f"test results provided: {passed}/{len(test_results_by_repo)} repos passed")
+    result = _run_review_pipeline(
+        roles, label, combined_payload, extra_context,
+        prior_result=prior_result, test_results_by_repo=test_results_by_repo,
+    )
     result["handoff_source"] = handoff_source
     result["request"] = {
         "repos": [
@@ -643,6 +741,8 @@ def review_branch_structured(
     handoff_path: str | None = None,
     no_handoff: bool = False,
     context: str | None = None,
+    prior_result: dict | None = None,
+    test_results_by_repo: dict | None = None,
 ) -> dict:
     """Server-friendly entrypoint. Runs a branch review and returns a structured result.
 
@@ -672,7 +772,10 @@ def review_branch_structured(
     extra_context = "\n\n---\n\n".join(parts).strip()
 
     info(f"mode=review (server)  subject={label}  size={len(payload)} chars")
-    result = _run_review_pipeline(roles, label, payload, extra_context)
+    result = _run_review_pipeline(
+        roles, label, payload, extra_context,
+        prior_result=prior_result, test_results_by_repo=test_results_by_repo,
+    )
     result["handoff_source"] = handoff_source
     result["request"] = {
         "repo": repo,

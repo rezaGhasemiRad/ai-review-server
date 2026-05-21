@@ -119,6 +119,16 @@ class ReviewRequest(BaseModel):
     no_handoff: bool = False
     context: Optional[str] = None
 
+    # Iteration memory — when set, the prior job's reconciled findings are
+    # included in the reviewer context to avoid re-raising resolved issues.
+    previous_job_id: Optional[str] = None
+
+    # Tier-1 test execution: if true (default), the server runs
+    # `.ai-collab/test.sh` per repo on the feature branch and feeds the
+    # results into the reviewer context.
+    run_tests: bool = True
+    test_timeout_s: int = 600  # 10 min per repo
+
     @field_validator("repo_url")
     @classmethod
     def _check_repo_url(cls, v: Optional[str]) -> Optional[str]:
@@ -203,6 +213,62 @@ def _repo_dir_for(url: str) -> pathlib.Path:
     return REPOS_DIR / name
 
 
+def _run_repo_tests(repo_path: str, ref: str, timeout_s: int) -> dict:
+    """Check out `ref` in a temp worktree and run .ai-collab/test.sh if present."""
+    import time
+    wt = pathlib.Path(repo_path).parent / f"wt-{uuid.uuid4().hex[:8]}"
+    started = time.monotonic()
+    try:
+        r = subprocess.run(
+            ["git", "-C", repo_path, "worktree", "add", "--detach", str(wt), ref],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            return {"status": "error", "reason": f"worktree add failed: {r.stderr.strip()}"}
+
+        script = wt / ".ai-collab" / "test.sh"
+        if not script.exists():
+            return {"status": "skipped", "reason": "no .ai-collab/test.sh on this branch"}
+
+        try:
+            subprocess.run(["chmod", "+x", str(script)], capture_output=True)
+            out = subprocess.run(
+                ["bash", str(script)],
+                cwd=str(wt),
+                capture_output=True, text=True, timeout=timeout_s,
+            )
+        except subprocess.TimeoutExpired:
+            return {"status": "timeout", "timeout_s": timeout_s,
+                    "duration_s": int(time.monotonic() - started)}
+
+        return {
+            "status": "passed" if out.returncode == 0 else "failed",
+            "exit_code": out.returncode,
+            "duration_s": int(time.monotonic() - started),
+            "stdout_tail": (out.stdout or "")[-8000:],
+            "stderr_tail": (out.stderr or "")[-4000:],
+        }
+    except Exception as e:
+        return {"status": "error", "reason": f"{type(e).__name__}: {e}",
+                "duration_s": int(time.monotonic() - started)}
+    finally:
+        subprocess.run(
+            ["git", "-C", repo_path, "worktree", "remove", "--force", str(wt)],
+            capture_output=True, text=True,
+        )
+
+
+def _load_prior_result(job_id: str) -> Optional[dict]:
+    """Return the `result` field of a prior complete job, or None."""
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+    if job is None:
+        job = _load_from_disk(job_id)
+    if job is None or job.get("status") != "complete":
+        return None
+    return job.get("result")
+
+
 def _ensure_repo(url: str) -> pathlib.Path:
     """Clone the repo on first use, otherwise fetch latest refs from origin."""
     target = _repo_dir_for(url)
@@ -255,28 +321,49 @@ def _run_job(job_id: str) -> None:
                 "base": f"origin/{r['base']}",
             })
 
+        # Prior iteration context (optional).
+        prior_result = None
+        if req.get("previous_job_id"):
+            prior_result = _load_prior_result(req["previous_job_id"])
+            if prior_result is None:
+                log.warning("previous_job_id %s did not resolve to a completed job; ignoring",
+                            req["previous_job_id"])
+
+        # Run per-repo tests in parallel (default on).
+        test_results_by_repo: dict = {}
+        if req.get("run_tests", True):
+            timeout_s = int(req.get("test_timeout_s") or 600)
+            log.info("running tests across %d repo(s), timeout=%ds each", len(prepared), timeout_s)
+            with ThreadPoolExecutor(max_workers=max(2, len(prepared))) as tpool:
+                futures = {
+                    p["repo_url"]: tpool.submit(_run_repo_tests, p["repo"], p["branch"], timeout_s)
+                    for p in prepared
+                }
+                for url, fut in futures.items():
+                    test_results_by_repo[url] = fut.result()
+            for url, tr in test_results_by_repo.items():
+                log.info("test result %s: status=%s exit=%s dur=%ss",
+                         url, tr.get("status"), tr.get("exit_code"), tr.get("duration_s"))
+
+        common = dict(
+            only_globs=req.get("only", []),
+            include_all=req.get("include_all", False),
+            summary_only=req.get("summary_only", False),
+            handoff_path=req.get("handoff_path"),
+            no_handoff=req.get("no_handoff", False),
+            context=req.get("context"),
+            prior_result=prior_result,
+            test_results_by_repo=test_results_by_repo or None,
+        )
+
         if len(prepared) == 1:
             p = prepared[0]
             result = ai_chat.review_branch_structured(
-                repo=p["repo"],
-                branch=p["branch"],
-                base=p["base"],
-                only_globs=req.get("only", []),
-                include_all=req.get("include_all", False),
-                summary_only=req.get("summary_only", False),
-                handoff_path=req.get("handoff_path"),
-                no_handoff=req.get("no_handoff", False),
-                context=req.get("context"),
+                repo=p["repo"], branch=p["branch"], base=p["base"], **common,
             )
         else:
             result = ai_chat.review_multi_repo_structured(
-                repos=prepared,
-                only_globs=req.get("only", []),
-                include_all=req.get("include_all", False),
-                summary_only=req.get("summary_only", False),
-                handoff_path=req.get("handoff_path"),
-                no_handoff=req.get("no_handoff", False),
-                context=req.get("context"),
+                repos=prepared, **common,
             )
 
         _update(job_id, status="complete", completed_at=_now(), result=result)
