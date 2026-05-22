@@ -201,8 +201,10 @@ async function loadList(){
       statusCell += '<div class="muted">'+esc(j.progress||'')+'</div>';
     let verdicts = (j.claude_verdict||j.codex_verdict)
       ? 'C:'+verdictTag(j.claude_verdict)+' X:'+verdictTag(j.codex_verdict) : '—';
-    if(j.findings_total) verdicts += '<div class="muted">'+j.findings_total+' findings'+
-      (j.cost_usd!=null?' · $'+j.cost_usd.toFixed(2):'')+'</div>';
+    const extra = [];
+    if(j.findings_total) extra.push(j.findings_total+' findings');
+    if(j.cost_usd!=null) extra.push('$'+j.cost_usd.toFixed(2));
+    if(extra.length) verdicts += '<div class="muted">'+extra.join(' · ')+'</div>';
     return '<tr class="row" onclick="openDetail(\''+j.job_id+'\')">'+
       '<td>'+statusCell+'</td>'+
       '<td>'+esc(pf)+'</td>'+
@@ -250,11 +252,18 @@ async function loadDetail(){
        esc(x.branch||'')+' &larr; '+esc(x.base||'')+'</div>').join('')+'</div>';
   const usage = r.usage;
   if(usage){
-    h += '<div class="muted" style="margin-top:8px">Cost: <b>$'+
-         (usage.total_usd||0).toFixed(4)+'</b> · '+
-         (usage.total_input_tokens||0).toLocaleString()+' in / '+
-         (usage.total_output_tokens||0).toLocaleString()+' out tokens'+
-         ' &nbsp;(Codex tokens only — no USD on subscription)</div>';
+    const c = usage.claude||{}, x = usage.codex||{};
+    const tk = n => (n||0).toLocaleString();
+    h += '<div style="margin-top:10px;padding:8px 10px;background:#f8f9fb;'+
+         'border:1px solid var(--line);border-radius:6px;font-size:12px">'+
+      '<b>Cost: $'+(usage.total_usd||0).toFixed(4)+'</b> &nbsp;·&nbsp; '+
+      tk(usage.total_input_tokens)+' in / '+tk(usage.total_output_tokens)+' out tokens'+
+      '<div class="muted" style="margin-top:4px">'+
+        'Claude — '+tk(c.input_tokens)+' in / '+tk(c.output_tokens)+' out · $'+
+        (c.usd||0).toFixed(4)+'<br>'+
+        'Codex &nbsp;— '+tk(x.input_tokens)+' in / '+tk(x.output_tokens)+' out '+
+        '(no USD — subscription)</div>'+
+      '</div>';
   }
   h += '</div>';
 
