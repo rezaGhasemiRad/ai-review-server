@@ -32,6 +32,13 @@
   .pager { display:flex; gap:12px; align-items:center; justify-content:center; }
   .filters { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
   .filters input { padding:7px 10px; border:1px solid var(--line); border-radius:6px; }
+  .filters select { padding:6px 8px; border:1px solid var(--line); border-radius:6px; }
+  .tab { background:#e5e7eb; color:var(--ink); border:0; padding:6px 13px;
+         border-radius:6px; cursor:pointer; font-size:13px; }
+  .tab.on { background:var(--ink); color:#fff; }
+  .mini { background:#e5e7eb; color:var(--ink); border:0; padding:4px 10px;
+          border-radius:5px; cursor:pointer; font-size:12px; }
+  .mini:hover { background:#d1d5db; }
   table { width:100%; border-collapse:collapse; }
   th { text-align:left; font-size:12px; color:var(--muted); text-transform:uppercase;
        letter-spacing:.04em; padding:8px 10px; border-bottom:2px solid var(--line); }
@@ -108,16 +115,28 @@
   <div class="wrap">
     <div id="listView">
       <div class="card filters">
-        <strong>Filter:</strong>
+        <button id="tabActive" class="tab on" onclick="setView(false)">Active</button>
+        <button id="tabArchived" class="tab" onclick="setView(true)">Archived</button>
+        <span style="width:8px"></span>
         <input id="fProject" placeholder="project" oninput="debouncedRefresh()">
         <input id="fFeature" placeholder="feature" oninput="debouncedRefresh()">
+        <input id="fRepo" placeholder="repo" oninput="debouncedRefresh()">
+        <span style="flex:1"></span>
+        <label class="muted">Per page
+          <select id="perPage" onchange="changePerPage()">
+            <option value="10">10</option>
+            <option value="25" selected>25</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+          </select>
+        </label>
         <span id="count" class="muted"></span>
       </div>
       <div class="card" style="padding:0">
         <table>
           <thead><tr>
             <th>Status</th><th>Project / Feature</th><th>Repos</th>
-            <th>Verdicts</th><th>Created</th>
+            <th>Verdicts</th><th>Created</th><th></th>
           </tr></thead>
           <tbody id="jobRows"></tbody>
         </table>
@@ -192,19 +211,34 @@ function renderFindings(findings){
   }).join('');
 }
 
-// --- list view (paginated) ---
-const PAGE_SIZE = 25;
+// --- list view (paginated, filterable, archive-aware) ---
 let page = 0;
+let perPage = 25;
+let showArchived = false;
 function pg(delta){ page = Math.max(0, page+delta); loadList(); }
+function changePerPage(){ perPage = +$('perPage').value; page = 0; loadList(); }
+function setView(arch){
+  showArchived = arch; page = 0;
+  $('tabActive').classList.toggle('on', !arch);
+  $('tabArchived').classList.toggle('on', arch);
+  loadList();
+}
+async function archiveJob(id, archive){
+  await fetch('/reviews/'+id+'/'+(archive?'archive':'unarchive'),
+    { method:'POST', headers:{ 'Authorization':'Bearer '+KEY } });
+  if(openJobId===id) loadDetail(); else loadList();
+}
 
 async function loadList(){
-  const p=$('fProject').value.trim(), f=$('fFeature').value.trim();
-  let q='/reviews?limit='+PAGE_SIZE+'&offset='+(page*PAGE_SIZE);
+  const p=$('fProject').value.trim(), f=$('fFeature').value.trim(),
+        rp=$('fRepo').value.trim();
+  let q='/reviews?limit='+perPage+'&offset='+(page*perPage)+'&archived='+showArchived;
   if(p) q+='&project='+encodeURIComponent(p);
   if(f) q+='&feature='+encodeURIComponent(f);
+  if(rp) q+='&repo='+encodeURIComponent(rp);
   const d = await api(q);
   const total = d.total||0;
-  const maxPage = Math.max(0, Math.ceil(total/PAGE_SIZE)-1);
+  const maxPage = Math.max(0, Math.ceil(total/perPage)-1);
   if(page>maxPage){ page=maxPage; return loadList(); }  // clamp after filter change
   const from = total ? d.offset+1 : 0, to = d.offset + d.count;
   $('count').textContent = total ? (from+'–'+to+' of '+total) : '0 jobs';
@@ -223,12 +257,16 @@ async function loadList(){
     if(j.findings_total) extra.push(j.findings_total+' findings');
     if(j.cost_usd!=null) extra.push('$'+j.cost_usd.toFixed(2));
     if(extra.length) verdicts += '<div class="muted">'+extra.join(' · ')+'</div>';
+    const archBtn = '<button class="mini" onclick="event.stopPropagation();'+
+      'archiveJob(\''+j.job_id+'\','+(showArchived?'false':'true')+')">'+
+      (showArchived?'Restore':'Archive')+'</button>';
     return '<tr class="row" onclick="openDetail(\''+j.job_id+'\')">'+
       '<td>'+statusCell+'</td>'+
       '<td>'+esc(pf)+'</td>'+
       '<td class="mono">'+esc(repos)+'</td>'+
       '<td>'+verdicts+'</td>'+
-      '<td class="muted">'+fmt(j.created_at)+'</td></tr>';
+      '<td class="muted">'+fmt(j.created_at)+'</td>'+
+      '<td>'+archBtn+'</td></tr>';
   }).join('');
   $('jobRows').innerHTML = rows;
   $('listEmpty').style.display = d.count? 'none':'block';
@@ -259,10 +297,15 @@ async function loadDetail(){
   const j = await api('/reviews/'+openJobId);
   const r = j.result || {};
   let h = '';
+  const isArch = !!j.archived;
   h += '<div class="card"><div style="display:flex;gap:12px;align-items:center">'+
     '<span class="badge b-'+j.status+'">'+j.status+'</span>'+
     '<strong>'+esc((j.project||'—')+' / '+(j.feature||'—'))+'</strong>'+
-    '<span class="mono muted">'+j.job_id+'</span></div>';
+    '<span class="mono muted">'+j.job_id+'</span>'+
+    (isArch?'<span class="muted">· archived</span>':'')+
+    '<span style="flex:1"></span>'+
+    '<button class="mini" onclick="archiveJob(\''+j.job_id+'\','+(isArch?'false':'true')+')">'+
+      (isArch?'Restore':'Archive')+'</button></div>';
   if(j.status==='running'||j.status==='queued')
     h += '<div class="progress" style="margin-top:10px"><div class="spin"></div>'+
          esc(j.progress||'working...')+'</div>';

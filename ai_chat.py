@@ -17,6 +17,13 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+
+# Model-call resilience (issue #3): each claude/codex invocation is bounded
+# by a timeout and retried on transient failure.
+MODEL_CALL_TIMEOUT_S = 600   # 10 min — a single review call should never exceed this
+MODEL_CALL_RETRIES = 1       # total attempts = RETRIES + 1
+MODEL_CALL_BACKOFF_S = 10
 
 # Hard cap on diff payload — model context limits.
 MAX_REVIEW_CHARS = 500_000
@@ -106,6 +113,34 @@ def load_roles(mode: str) -> dict[str, str]:
 EMPTY_USAGE = {"input_tokens": 0, "output_tokens": 0, "usd": 0.0}
 
 
+def _run_cli(cmd: list[str], stdin_text: str, label: str) -> subprocess.CompletedProcess:
+    """Run a model CLI with a timeout, retrying on timeout or non-zero exit.
+
+    Transient failures (rate limit, network blip, a hung call) recover;
+    a genuinely broken call just fails one retry later. Raises RuntimeError
+    after the final attempt.
+    """
+    last_err = "unknown error"
+    for attempt in range(MODEL_CALL_RETRIES + 1):
+        try:
+            result = subprocess.run(
+                cmd, input=stdin_text, capture_output=True, text=True,
+                encoding="utf-8", timeout=MODEL_CALL_TIMEOUT_S,
+            )
+            if result.returncode == 0:
+                return result
+            last_err = (f"exit {result.returncode}: "
+                        f"{(result.stderr or '').strip()[:300]}")
+        except subprocess.TimeoutExpired:
+            last_err = f"timed out after {MODEL_CALL_TIMEOUT_S}s"
+        if attempt < MODEL_CALL_RETRIES:
+            info(f"{label} failed ({last_err}); retry in {MODEL_CALL_BACKOFF_S}s")
+            time.sleep(MODEL_CALL_BACKOFF_S)
+    raise RuntimeError(
+        f"{label} failed after {MODEL_CALL_RETRIES + 1} attempt(s): {last_err}"
+    )
+
+
 def call_claude(role: str, user_msg: str) -> tuple[str, dict]:
     """Run claude in JSON-output mode. Returns (text, usage).
 
@@ -118,13 +153,7 @@ def call_claude(role: str, user_msg: str) -> tuple[str, dict]:
         "--output-format", "json",
         "--append-system-prompt", role,
     ]
-    result = subprocess.run(
-        cmd, input=user_msg, capture_output=True, text=True, encoding="utf-8"
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"claude failed (exit {result.returncode}): {result.stderr.strip()}"
-        )
+    result = _run_cli(cmd, user_msg, "claude")
     try:
         env = json.loads(result.stdout)
         u = env.get("usage") or {}
@@ -162,13 +191,7 @@ def call_codex(role: str, user_msg: str) -> tuple[str, dict]:
             "--output-last-message", out_path,
             "-",  # read prompt from stdin
         ]
-        result = subprocess.run(
-            cmd, input=combined, capture_output=True, text=True, encoding="utf-8"
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"codex failed (exit {result.returncode}): {result.stderr.strip()}"
-            )
+        result = _run_cli(cmd, combined, "codex")
         text = pathlib.Path(out_path).read_text(encoding="utf-8").strip()
         usage = dict(EMPTY_USAGE)
         for line in result.stdout.splitlines():

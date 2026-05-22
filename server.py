@@ -624,6 +624,7 @@ def _job_summary(job: dict) -> dict:
         "project": job.get("project"),
         "feature": job.get("feature"),
         "previous_job_id": job.get("previous_job_id"),
+        "archived": bool(job.get("archived")),
         "repos": _repo_names(job),
         "created_at": job.get("created_at"),
         "completed_at": job.get("completed_at"),
@@ -639,20 +640,28 @@ def _job_summary(job: dict) -> dict:
 
 @app.get("/reviews", dependencies=[Depends(require_bearer)])
 def list_reviews(limit: int = 25, offset: int = 0,
-                 project: Optional[str] = None, feature: Optional[str] = None):
-    """Paginated job list, newest first. Optionally filter by project/feature.
+                 project: Optional[str] = None, feature: Optional[str] = None,
+                 repo: Optional[str] = None, archived: bool = False):
+    """Paginated job list, newest first.
 
-    Returns `total` (matching jobs) so the client can page; `jobs` is the
-    `limit`-sized slice starting at `offset`.
+    Filters: project, feature, repo (case-insensitive substring of any
+    participating repo URL). `archived` selects the archive (default: only
+    non-archived jobs). Returns `total` for client-side paging.
     """
     limit = max(1, min(limit, 200))
     offset = max(0, offset)
+    repo_q = repo.lower() if repo else None
     matched = []
     for j in _iter_jobs():
+        if bool(j.get("archived")) != archived:
+            continue
         if project is not None and j.get("project") != project:
             continue
         if feature is not None and j.get("feature") != feature:
             continue
+        if repo_q is not None:
+            if not any(repo_q in n.lower() for n in _repo_names(j)):
+                continue
         matched.append(j)
     page = matched[offset:offset + limit]
     return {
@@ -662,6 +671,32 @@ def list_reviews(limit: int = 25, offset: int = 0,
         "count": len(page),
         "jobs": [_job_summary(j) for j in page],
     }
+
+
+def _set_archived(job_id: str, value: bool) -> dict:
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+    if job is None:
+        job = _load_from_disk(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    job["archived"] = value
+    with JOBS_LOCK:
+        JOBS[job_id] = job
+    _persist(job)
+    return job
+
+
+@app.post("/reviews/{job_id}/archive", dependencies=[Depends(require_bearer)])
+def archive_job(job_id: str):
+    _set_archived(job_id, True)
+    return {"job_id": job_id, "archived": True}
+
+
+@app.post("/reviews/{job_id}/unarchive", dependencies=[Depends(require_bearer)])
+def unarchive_job(job_id: str):
+    _set_archived(job_id, False)
+    return {"job_id": job_id, "archived": False}
 
 
 @app.get("/features/{project}/{feature}", dependencies=[Depends(require_bearer)])
