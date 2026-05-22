@@ -293,6 +293,8 @@ cat > ~/.ai-review-alerts.env <<EOF
 TELEGRAM_BOT_TOKEN=$BOT
 TELEGRAM_CHAT_ID=$CHAT
 TELEGRAM_WEBHOOK_SECRET=$SEC
+# Optional — the healthcheck pings this URL as check #2. Leave unset to skip.
+PUBLIC_URL=https://review.<your-domain>/healthz
 EOF
 chmod 600 ~/.ai-review-alerts.env
 unset BOT CHAT SEC
@@ -359,8 +361,8 @@ EOF
 chmod 600 ~/.aws/credentials
 unset AK SK
 
-# Edit ops/backup.sh and set BUCKET="s3://YOUR-BUCKET/ai-review-server"
-nano ops/backup.sh
+# Tell backup.sh which bucket to use (reads from ~/.ai-review-alerts.env)
+echo "BACKUP_BUCKET=s3://YOUR-BUCKET/ai-review-server" >> ~/.ai-review-alerts.env
 
 chmod +x ops/backup.sh
 sudo cp ops/ai-review-backup.service ops/ai-review-backup.timer /etc/systemd/system/

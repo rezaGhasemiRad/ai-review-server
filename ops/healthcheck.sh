@@ -12,10 +12,13 @@ set -u
 ALERT_ENV="/home/ubuntu/.ai-review-alerts.env"
 STATE_FILE="/home/ubuntu/.ai-review-health-state"
 ROOT="/home/ubuntu/ai-review-server"
-PUBLIC_URL="https://review.befalta.com/healthz"
 
 # shellcheck disable=SC1090
 [ -f "$ALERT_ENV" ] && . "$ALERT_ENV"
+
+# Public endpoint check is opt-in. Set PUBLIC_URL=https://review.<your-domain>/healthz
+# in $ALERT_ENV to enable it; otherwise check #2 below is skipped.
+PUBLIC_URL="${PUBLIC_URL:-}"
 
 send_telegram() {
   local msg="$1"
@@ -38,9 +41,11 @@ problems=()
 curl -fsS -m 10 http://127.0.0.1:8080/healthz >/dev/null 2>&1 \
   || problems+=("API server not responding on localhost:8080")
 
-# 2. Public HTTPS endpoint (catches Caddy / TLS / proxy faults)
-curl -fsS -m 15 "$PUBLIC_URL" >/dev/null 2>&1 \
-  || problems+=("public endpoint $PUBLIC_URL unreachable (Caddy/TLS?)")
+# 2. Public HTTPS endpoint (catches Caddy / TLS / proxy faults). Opt-in.
+if [ -n "$PUBLIC_URL" ]; then
+  curl -fsS -m 15 "$PUBLIC_URL" >/dev/null 2>&1 \
+    || problems+=("public endpoint $PUBLIC_URL unreachable (Caddy/TLS?)")
+fi
 
 # 3. Services active
 for svc in ai-review-server caddy postgresql; do

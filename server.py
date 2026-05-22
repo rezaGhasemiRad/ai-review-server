@@ -722,7 +722,7 @@ def _repo_names(job: dict) -> list[str]:
 
 
 def _short_repo(url: str) -> str:
-    """`git@github.com:owner/Thabbit.git` -> `Thabbit`."""
+    """`git@github.com:owner/myrepo.git` -> `myrepo`."""
     name = (url or "").rstrip("/").rsplit("/", 1)[-1]
     if name.endswith(".git"):
         name = name[:-4]

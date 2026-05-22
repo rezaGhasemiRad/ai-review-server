@@ -5,7 +5,19 @@
 # none of those are backed up.
 set -euo pipefail
 
-BUCKET="s3://ai-workflow-backup/ai-review-server"
+# Site config — set BACKUP_BUCKET in ~/.ai-review-alerts.env to
+# s3://<your-bucket>/ai-review-server (or any S3 prefix you choose).
+ALERT_ENV="/home/ubuntu/.ai-review-alerts.env"
+# shellcheck disable=SC1090
+[ -f "$ALERT_ENV" ] && . "$ALERT_ENV"
+
+BUCKET="${BACKUP_BUCKET:-}"
+if [ -z "$BUCKET" ]; then
+    echo "BACKUP_BUCKET not set in $ALERT_ENV — refusing to run." >&2
+    echo "Add e.g. BACKUP_BUCKET=s3://my-bucket/ai-review-server" >&2
+    exit 1
+fi
+
 ROOT="/home/ubuntu/ai-review-server"
 HOME_DIR="/home/ubuntu"
 
