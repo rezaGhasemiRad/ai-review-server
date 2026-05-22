@@ -614,17 +614,25 @@ def _extract_verdict(review_md: Optional[str]) -> Optional[str]:
 
 def _job_summary(job: dict) -> dict:
     result = job.get("result") or {}
+    findings_total = len(result.get("claude_findings") or []) \
+        + len(result.get("codex_findings") or [])
+    usage = result.get("usage") or {}
     return {
         "job_id": job.get("job_id"),
         "status": job.get("status"),
+        "progress": job.get("progress"),
         "project": job.get("project"),
         "feature": job.get("feature"),
         "previous_job_id": job.get("previous_job_id"),
         "repos": _repo_names(job),
         "created_at": job.get("created_at"),
         "completed_at": job.get("completed_at"),
-        "claude_verdict": _extract_verdict(result.get("claude_review")),
-        "codex_verdict": _extract_verdict(result.get("codex_review")),
+        "claude_verdict": result.get("claude_verdict")
+        or _extract_verdict(result.get("claude_review")),
+        "codex_verdict": result.get("codex_verdict")
+        or _extract_verdict(result.get("codex_review")),
+        "findings_total": findings_total,
+        "cost_usd": usage.get("total_usd"),
         "error": job.get("error"),
     }
 

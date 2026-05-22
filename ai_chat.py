@@ -10,7 +10,9 @@ Usage:
 import argparse
 import datetime
 import fnmatch
+import json
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -101,11 +103,19 @@ def load_roles(mode: str) -> dict[str, str]:
     return sections
 
 
-def call_claude(role: str, user_msg: str) -> str:
-    """Pipe user_msg via stdin to avoid Windows 8191-char command line limit."""
+EMPTY_USAGE = {"input_tokens": 0, "output_tokens": 0, "usd": 0.0}
+
+
+def call_claude(role: str, user_msg: str) -> tuple[str, dict]:
+    """Run claude in JSON-output mode. Returns (text, usage).
+
+    usage = {input_tokens, output_tokens, usd}. Falls back to plain text
+    parsing if the JSON envelope can't be read.
+    """
     cmd = [
         CLAUDE_BIN,
         "-p",
+        "--output-format", "json",
         "--append-system-prompt", role,
     ]
     result = subprocess.run(
@@ -115,11 +125,28 @@ def call_claude(role: str, user_msg: str) -> str:
         raise RuntimeError(
             f"claude failed (exit {result.returncode}): {result.stderr.strip()}"
         )
-    return result.stdout.strip()
+    try:
+        env = json.loads(result.stdout)
+        u = env.get("usage") or {}
+        usage = {
+            "input_tokens": (u.get("input_tokens", 0) or 0)
+            + (u.get("cache_read_input_tokens", 0) or 0)
+            + (u.get("cache_creation_input_tokens", 0) or 0),
+            "output_tokens": u.get("output_tokens", 0) or 0,
+            "usd": float(env.get("total_cost_usd", 0.0) or 0.0),
+        }
+        return (env.get("result", "") or "").strip(), usage
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        return result.stdout.strip(), dict(EMPTY_USAGE)
 
 
-def call_codex(role: str, user_msg: str) -> str:
-    """Pipe role+user_msg via stdin; capture clean reply via --output-last-message."""
+def call_codex(role: str, user_msg: str) -> tuple[str, dict]:
+    """Run codex in JSON-event mode. Returns (text, usage).
+
+    Clean reply text comes from --output-last-message; token usage is
+    parsed from the `turn.completed` event on stdout. Codex reports no
+    USD (subscription), so usd stays 0.
+    """
     combined = f"{role}\n\n---\n\n{user_msg}"
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".txt", delete=False, encoding="utf-8"
@@ -131,7 +158,7 @@ def call_codex(role: str, user_msg: str) -> str:
             "-s", "read-only",
             "--skip-git-repo-check",
             "--ephemeral",
-            "--color", "never",
+            "--json",
             "--output-last-message", out_path,
             "-",  # read prompt from stdin
         ]
@@ -142,12 +169,44 @@ def call_codex(role: str, user_msg: str) -> str:
             raise RuntimeError(
                 f"codex failed (exit {result.returncode}): {result.stderr.strip()}"
             )
-        return pathlib.Path(out_path).read_text(encoding="utf-8").strip()
+        text = pathlib.Path(out_path).read_text(encoding="utf-8").strip()
+        usage = dict(EMPTY_USAGE)
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if ev.get("type") == "turn.completed":
+                u = ev.get("usage") or {}
+                usage["input_tokens"] = (u.get("input_tokens", 0) or 0) \
+                    + (u.get("cached_input_tokens", 0) or 0)
+                usage["output_tokens"] = u.get("output_tokens", 0) or 0
+        return text, usage
     finally:
         try:
             pathlib.Path(out_path).unlink()
         except OSError:
             pass
+
+
+def _extract_findings_block(review_text: str) -> tuple[str, dict | None]:
+    """Split a trailing ```json {...}``` findings block off a review.
+
+    Returns (clean_markdown_with_block_removed, parsed_dict_or_None).
+    Never raises — a malformed block just yields None.
+    """
+    txt = review_text.strip()
+    m = re.search(r"```json\s*(\{.*\})\s*```\s*$", txt, re.DOTALL)
+    if not m:
+        return review_text, None
+    try:
+        data = json.loads(m.group(1))
+    except (json.JSONDecodeError, ValueError):
+        return review_text, None
+    return txt[:m.start()].rstrip(), data
 
 
 def build_transcript_view(history: list[dict], for_speaker: str) -> str:
@@ -468,6 +527,32 @@ def _build_prior_iteration_section(prior_result: dict | None) -> str:
         "explicitly accepted as out-of-scope.",
         "",
     ]
+    def _findings_digest(findings: list) -> str:
+        if not findings:
+            return "_(no structured findings recorded)_"
+        rows = []
+        for f in findings:
+            if not isinstance(f, dict):
+                continue
+            sev = f.get("severity", "?")
+            loc = f.get("file") or f.get("repo") or ""
+            rows.append(f"- [{sev}] {f.get('title', '(untitled)')}"
+                        + (f" — `{loc}`" if loc else ""))
+        return "\n".join(rows) if rows else "_(no structured findings recorded)_"
+
+    cf = prior_result.get("claude_findings")
+    co_f = prior_result.get("codex_findings")
+    if cf is not None or co_f is not None:
+        parts += [
+            "### Findings raised in the prior pass",
+            "",
+            "Reviewer A (Claude):",
+            _findings_digest(cf or []),
+            "",
+            "Reviewer B (Codex):",
+            _findings_digest(co_f or []),
+            "",
+        ]
     cr = prior_result.get("claude_reconcile")
     if cr:
         parts += ["### Prior reviewer A (Claude) — reconciled", "", cr, ""]
@@ -555,20 +640,40 @@ def _run_review_pipeline(
             "even if the rest of the diff looks fine."
             if test_block else ""
         )
+        + "\n\n# Machine-readable findings\n"
+        "After your markdown review, append a fenced ```json code block — and NOTHING "
+        "after it — matching this exact shape:\n"
+        '{"verdict": "approve|request-changes|blocking", "findings": ['
+        '{"severity": "bug|concern|nit", "repo": "<repo name or null>", '
+        '"file": "<path or null>", "lines": "<range or null>", '
+        '"title": "<one-line summary>", "detail": "<short explanation>"}]}\n'
+        "The findings array must mirror the issues in your markdown review — one entry "
+        "per concrete issue. If you found nothing in a category, simply omit it. The "
+        "markdown review above the block stays the human-readable version; the JSON is "
+        "the machine copy."
     )
 
     history: list[dict] = [{"speaker": "system", "text": f"Subject: {label}\n\n{payload}"}]
+    usage_acc = {"claude": dict(EMPTY_USAGE), "codex": dict(EMPTY_USAGE)}
+
+    def _add(who: str, u: dict) -> None:
+        for k in ("input_tokens", "output_tokens", "usd"):
+            usage_acc[who][k] += u.get(k, 0) or 0
 
     info("phase 1/2 — independent reviews")
     cb("phase 1/2 · Claude reviewing")
     info("claude reviewing...")
-    claude_review = call_claude(roles["claude"], initial_msg)
+    claude_review, u = call_claude(roles["claude"], initial_msg)
+    _add("claude", u)
+    claude_review, claude_block = _extract_findings_block(claude_review)
     speak("claude", claude_review)
     history.append({"speaker": "claude (initial)", "text": claude_review})
 
     cb("phase 1/2 · Codex reviewing")
     info("codex reviewing...")
-    codex_review = call_codex(roles["codex"], initial_msg)
+    codex_review, u = call_codex(roles["codex"], initial_msg)
+    _add("codex", u)
+    codex_review, codex_block = _extract_findings_block(codex_review)
     speak("codex", codex_review)
     history.append({"speaker": "codex (initial)", "text": codex_review})
 
@@ -591,13 +696,15 @@ def _run_review_pipeline(
 
     cb("phase 2/2 · Claude reconciling")
     info("claude reconciling...")
-    claude_reconcile = call_claude(roles["claude"], reconcile_msg)
+    claude_reconcile, u = call_claude(roles["claude"], reconcile_msg)
+    _add("claude", u)
     speak("claude", claude_reconcile)
     history.append({"speaker": "claude (reconcile)", "text": claude_reconcile})
 
     cb("phase 2/2 · Codex reconciling")
     info("codex reconciling...")
-    codex_reconcile = call_codex(roles["codex"], reconcile_msg)
+    codex_reconcile, u = call_codex(roles["codex"], reconcile_msg)
+    _add("codex", u)
     speak("codex", codex_reconcile)
     history.append({"speaker": "codex (reconcile)", "text": codex_reconcile})
     cb("finalizing")
@@ -605,12 +712,43 @@ def _run_review_pipeline(
     transcript_path = save_transcript("review", label, history)
     transcript_md = transcript_path.read_text(encoding="utf-8")
 
+    def _findings(block: dict | None) -> list:
+        if isinstance(block, dict) and isinstance(block.get("findings"), list):
+            return block["findings"]
+        return []
+
+    def _verdict(block: dict | None, review_md: str) -> str | None:
+        if isinstance(block, dict) and block.get("verdict"):
+            return str(block["verdict"]).lower()
+        m = re.search(r"\*{0,2}Verdict:?\*{0,2}\s*`?([A-Za-z\-]+)`?", review_md)
+        return m.group(1).lower() if m else None
+
+    claude_findings = _findings(claude_block)
+    codex_findings = _findings(codex_block)
+    usage = {
+        "claude": usage_acc["claude"],
+        "codex": usage_acc["codex"],
+        "total_input_tokens": usage_acc["claude"]["input_tokens"] + usage_acc["codex"]["input_tokens"],
+        "total_output_tokens": usage_acc["claude"]["output_tokens"] + usage_acc["codex"]["output_tokens"],
+        "total_usd": round(usage_acc["claude"]["usd"] + usage_acc["codex"]["usd"], 4),
+    }
+    info(
+        f"usage: claude {usage_acc['claude']['input_tokens']}/{usage_acc['claude']['output_tokens']} tok "
+        f"${usage_acc['claude']['usd']:.4f} · codex "
+        f"{usage_acc['codex']['input_tokens']}/{usage_acc['codex']['output_tokens']} tok"
+    )
+
     return {
         "label": label,
         "claude_review": claude_review,
         "codex_review": codex_review,
         "claude_reconcile": claude_reconcile,
         "codex_reconcile": codex_reconcile,
+        "claude_findings": claude_findings,
+        "codex_findings": codex_findings,
+        "claude_verdict": _verdict(claude_block, claude_review),
+        "codex_verdict": _verdict(codex_block, codex_review),
+        "usage": usage,
         "transcript_path": str(transcript_path),
         "transcript_md": transcript_md,
     }
@@ -824,9 +962,9 @@ def run(mode: str, seed: str, turns: int) -> None:
             info(f"round {round_idx + 1}/{turns} — {speaker} thinking...")
             try:
                 if speaker == "claude":
-                    text = call_claude(role, user_msg)
+                    text, _ = call_claude(role, user_msg)
                 else:
-                    text = call_codex(role, user_msg)
+                    text, _ = call_codex(role, user_msg)
             except Exception as e:
                 info(f"{speaker} errored: {e}")
                 text = f"(error: {e})"

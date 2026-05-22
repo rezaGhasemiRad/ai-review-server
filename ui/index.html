@@ -68,6 +68,18 @@
              border-bottom:1px solid var(--line); }
   .t-passed{color:var(--green);} .t-failed,.t-timeout,.t-error{color:var(--red);}
   .t-skipped{color:var(--muted);}
+  .finding { border-left:3px solid var(--line); padding:6px 10px; margin:7px 0;
+             background:#fafbfc; border-radius:0 6px 6px 0; }
+  .finding.f-bug{border-color:var(--red);}
+  .finding.f-concern{border-color:var(--amber);}
+  .finding.f-nit{border-color:var(--grey);}
+  .sev { font-size:11px; font-weight:700; padding:1px 6px; border-radius:4px;
+         text-transform:uppercase; }
+  .sev-bug{background:#fee2e2;color:#b91c1c;}
+  .sev-concern{background:#fef3c7;color:#b45309;}
+  .sev-nit{background:#f1f3f5;color:#6b7280;}
+  .fgrid { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  @media(max-width:720px){ .fgrid{grid-template-columns:1fr;} }
   a.back { color:var(--blue); cursor:pointer; text-decoration:none; font-size:13px; }
   details summary { cursor:pointer; color:var(--blue); font-size:13px; }
   .empty { text-align:center; color:var(--muted); padding:40px; }
@@ -159,6 +171,19 @@ function verdictTag(v){
   const cls = 'v-'+v.replace(/[^a-z]/g,'');
   return '<span class="verdict '+cls+'">'+esc(v)+'</span>';
 }
+function renderFindings(findings){
+  if(!findings || !findings.length) return '<span class="muted">none</span>';
+  return findings.map(f=>{
+    const sev = (f.severity||'nit').toLowerCase();
+    const loc = [f.repo,f.file,f.lines].filter(Boolean).join(' · ');
+    return '<div class="finding f-'+sev+'">'+
+      '<span class="sev sev-'+sev+'">'+esc(sev)+'</span> '+
+      '<b>'+esc(f.title||'(untitled)')+'</b>'+
+      (loc?'<div class="muted mono">'+esc(loc)+'</div>':'')+
+      (f.detail?'<div style="margin-top:2px">'+esc(f.detail)+'</div>':'')+
+      '</div>';
+  }).join('');
+}
 
 // --- list view ---
 async function loadList(){
@@ -174,8 +199,10 @@ async function loadList(){
     let statusCell = '<span class="badge b-'+j.status+'">'+j.status+'</span>';
     if(j.status==='running'||j.status==='queued')
       statusCell += '<div class="muted">'+esc(j.progress||'')+'</div>';
-    const verdicts = (j.claude_verdict||j.codex_verdict)
+    let verdicts = (j.claude_verdict||j.codex_verdict)
       ? 'C:'+verdictTag(j.claude_verdict)+' X:'+verdictTag(j.codex_verdict) : '—';
+    if(j.findings_total) verdicts += '<div class="muted">'+j.findings_total+' findings'+
+      (j.cost_usd!=null?' · $'+j.cost_usd.toFixed(2):'')+'</div>';
     return '<tr class="row" onclick="openDetail(\''+j.job_id+'\')">'+
       '<td>'+statusCell+'</td>'+
       '<td>'+esc(pf)+'</td>'+
@@ -221,7 +248,25 @@ async function loadDetail(){
   h += '<div style="margin-top:8px">'+repoList.map(x=>
        '<div class="mono">'+esc(shortRepo(x.repo_url))+' &nbsp; '+
        esc(x.branch||'')+' &larr; '+esc(x.base||'')+'</div>').join('')+'</div>';
+  const usage = r.usage;
+  if(usage){
+    h += '<div class="muted" style="margin-top:8px">Cost: <b>$'+
+         (usage.total_usd||0).toFixed(4)+'</b> · '+
+         (usage.total_input_tokens||0).toLocaleString()+' in / '+
+         (usage.total_output_tokens||0).toLocaleString()+' out tokens'+
+         ' &nbsp;(Codex tokens only — no USD on subscription)</div>';
+  }
   h += '</div>';
+
+  // findings
+  if(r.claude_findings || r.codex_findings){
+    h += '<div class="card"><h3 style="margin:0 0 10px">Findings</h3><div class="fgrid">'+
+      '<div><div class="muted" style="margin-bottom:4px">Claude · '+
+        (r.claude_findings||[]).length+'</div>'+renderFindings(r.claude_findings)+'</div>'+
+      '<div><div class="muted" style="margin-bottom:4px">Codex · '+
+        (r.codex_findings||[]).length+'</div>'+renderFindings(r.codex_findings)+'</div>'+
+      '</div></div>';
+  }
 
   // test results
   if(r.test_results){
