@@ -24,9 +24,12 @@ import os
 import pathlib
 import re
 import secrets
+import shutil
+import signal
 import subprocess
 import sys
 import threading
+import time
 import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -235,8 +238,12 @@ def _test_env() -> dict:
 
 
 def _run_repo_tests(repo_path: str, ref: str, timeout_s: int) -> dict:
-    """Check out `ref` in a temp worktree and run .ai-collab/test.sh if present."""
-    import time
+    """Check out `ref` in a temp worktree and run .ai-collab/test.sh if present.
+
+    The test script runs in its own process session so that on timeout the
+    ENTIRE process tree (bash + node/dotnet children) is killed — otherwise
+    orphan children survive, keep file handles open, and leak the worktree.
+    """
     wt = pathlib.Path(repo_path).parent / f"wt-{uuid.uuid4().hex[:8]}"
     started = time.monotonic()
     try:
@@ -251,31 +258,54 @@ def _run_repo_tests(repo_path: str, ref: str, timeout_s: int) -> dict:
         if not script.exists():
             return {"status": "skipped", "reason": "no .ai-collab/test.sh on this branch"}
 
+        subprocess.run(["chmod", "+x", str(script)], capture_output=True)
+        proc = subprocess.Popen(
+            ["bash", str(script)],
+            cwd=str(wt),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=_test_env(),
+            start_new_session=True,  # own process group → killable as a tree
+        )
         try:
-            subprocess.run(["chmod", "+x", str(script)], capture_output=True)
-            out = subprocess.run(
-                ["bash", str(script)],
-                cwd=str(wt),
-                capture_output=True, text=True, timeout=timeout_s,
-                env=_test_env(),
-            )
+            out, err = proc.communicate(timeout=timeout_s)
+            rc = proc.returncode
+            return {
+                "status": "passed" if rc == 0 else "failed",
+                "exit_code": rc,
+                "duration_s": int(time.monotonic() - started),
+                "stdout_tail": (out or "")[-8000:],
+                "stderr_tail": (err or "")[-4000:],
+            }
         except subprocess.TimeoutExpired:
-            return {"status": "timeout", "timeout_s": timeout_s,
-                    "duration_s": int(time.monotonic() - started)}
-
-        return {
-            "status": "passed" if out.returncode == 0 else "failed",
-            "exit_code": out.returncode,
-            "duration_s": int(time.monotonic() - started),
-            "stdout_tail": (out.stdout or "")[-8000:],
-            "stderr_tail": (out.stderr or "")[-4000:],
-        }
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                out, err = proc.communicate(timeout=15)
+            except subprocess.TimeoutExpired:
+                out, err = "", ""
+            return {
+                "status": "timeout",
+                "timeout_s": timeout_s,
+                "duration_s": int(time.monotonic() - started),
+                "stdout_tail": (out or "")[-8000:],
+                "stderr_tail": (err or "")[-4000:],
+            }
     except Exception as e:
         return {"status": "error", "reason": f"{type(e).__name__}: {e}",
                 "duration_s": int(time.monotonic() - started)}
     finally:
+        # Belt-and-braces cleanup: drop the git worktree registration, then
+        # force-delete any files left behind (timed-out builds leave artifacts
+        # git's own remove can't unlink), then prune dangling metadata.
         subprocess.run(
             ["git", "-C", repo_path, "worktree", "remove", "--force", str(wt)],
+            capture_output=True, text=True,
+        )
+        shutil.rmtree(wt, ignore_errors=True)
+        subprocess.run(
+            ["git", "-C", repo_path, "worktree", "prune"],
             capture_output=True, text=True,
         )
 
@@ -405,6 +435,48 @@ def _run_job(job_id: str) -> None:
 # --------------------------------------------------------------------------- #
 # App
 # --------------------------------------------------------------------------- #
+
+def _reconcile_on_startup() -> None:
+    """Recover from an unclean shutdown.
+
+    1. Any job still marked running/queued was orphaned when the process died
+       (its worker thread is gone). Mark it errored so clients stop polling.
+    2. Delete stale `wt-*` test-worktree directories left by interrupted runs.
+    3. Prune dangling worktree metadata from each repo clone.
+    """
+    orphaned = 0
+    for p in JOBS_DIR.glob("*.json"):
+        try:
+            job = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if job.get("status") in ("running", "queued"):
+            job["status"] = "error"
+            job["error"] = "interrupted by server restart"
+            job["completed_at"] = _now()
+            p.write_text(json.dumps(job, indent=2, default=str), encoding="utf-8")
+            orphaned += 1
+    if orphaned:
+        log.warning("startup: marked %d orphaned job(s) as error", orphaned)
+
+    swept = 0
+    for wt in REPOS_DIR.glob("wt-*"):
+        if wt.is_dir():
+            shutil.rmtree(wt, ignore_errors=True)
+            swept += 1
+    if swept:
+        log.warning("startup: swept %d stale worktree dir(s)", swept)
+
+    for repo in REPOS_DIR.iterdir():
+        if repo.is_dir() and not repo.name.startswith("wt-") and (repo / ".git").exists():
+            subprocess.run(
+                ["git", "-C", str(repo), "worktree", "prune"],
+                capture_output=True, text=True,
+            )
+
+
+_reconcile_on_startup()
+
 
 app = FastAPI(
     title="AI Review Server",
