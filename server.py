@@ -130,7 +130,7 @@ class ReviewRequest(BaseModel):
     # `.ai-collab/test.sh` per repo on the feature branch and feeds the
     # results into the reviewer context.
     run_tests: bool = True
-    test_timeout_s: int = 600  # 10 min per repo
+    test_timeout_s: int = 900  # 15 min per repo (4 GB / 2 vCPU box)
 
     @field_validator("repo_url")
     @classmethod
