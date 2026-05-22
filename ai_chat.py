@@ -458,6 +458,7 @@ def load_code_input(
 
 
 HANDOFF_AUTO_PATHS = ["HANDOFF.md", ".ai-collab/HANDOFF.md", "docs/HANDOFF.md"]
+_SAFE_FEATURE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 def _load_handoff(
@@ -465,11 +466,26 @@ def _load_handoff(
     repo: str | None,
     handoff_path: str | None,
     no_handoff: bool,
+    feature: str | None = None,
 ) -> tuple[str, str] | None:
-    """Return (source_label, content) if a handoff was found, else None."""
+    """Return (source_label, content) if a handoff was found, else None.
+
+    Discovery order when no explicit handoff_path is given:
+      1. .ai-collab/handoffs/<feature>.md   (per-feature — preferred)
+      2. HANDOFF.md / .ai-collab/HANDOFF.md / docs/HANDOFF.md  (legacy fallback)
+
+    Per-feature files prevent a stale handoff from one feature being
+    inherited by the next via a reused branch.
+    """
     if no_handoff or not branch:
         return None
-    candidates = [handoff_path] if handoff_path else HANDOFF_AUTO_PATHS
+    if handoff_path:
+        candidates = [handoff_path]
+    else:
+        candidates = []
+        if feature and _SAFE_FEATURE_RE.match(feature):
+            candidates.append(f".ai-collab/handoffs/{feature}.md")
+        candidates += HANDOFF_AUTO_PATHS
     for path in candidates:
         r = _git(repo, "show", f"{branch}:{path}")
         if r.returncode == 0 and r.stdout.strip():
@@ -808,6 +824,7 @@ def review_multi_repo_structured(
     prior_result: dict | None = None,
     test_results_by_repo: dict | None = None,
     progress_cb=None,
+    feature: str | None = None,
 ) -> dict:
     """Run a single review whose subject is changes across multiple repos.
 
@@ -847,7 +864,7 @@ def review_multi_repo_structured(
 
         # First handoff found wins.
         if handoff_content is None:
-            h = _load_handoff(branch, repo_path, handoff_path, no_handoff)
+            h = _load_handoff(branch, repo_path, handoff_path, no_handoff, feature)
             if h:
                 handoff_source = f"{repo_id} @ {h[0]}"
                 handoff_content = h[1]
@@ -914,6 +931,7 @@ def review_branch_structured(
     prior_result: dict | None = None,
     test_results_by_repo: dict | None = None,
     progress_cb=None,
+    feature: str | None = None,
 ) -> dict:
     """Server-friendly entrypoint. Runs a branch review and returns a structured result.
 
@@ -932,7 +950,7 @@ def review_branch_structured(
     )
 
     parts: list[str] = []
-    handoff = _load_handoff(branch, repo, handoff_path, no_handoff)
+    handoff = _load_handoff(branch, repo, handoff_path, no_handoff, feature)
     handoff_source = None
     if handoff:
         handoff_source, content = handoff

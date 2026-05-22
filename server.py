@@ -370,7 +370,9 @@ def _run_job(job_id: str) -> None:
 
     try:
         with JOBS_LOCK:
-            req = dict(JOBS[job_id]["request"])
+            job_rec = JOBS[job_id]
+            req = dict(job_rec["request"])
+            job_feature = job_rec.get("feature")
         _update(job_id, status="running", started_at=_now(), progress="cloning repositories")
 
         repos_in = req.get("repos") or []
@@ -431,6 +433,7 @@ def _run_job(job_id: str) -> None:
             prior_result=prior_result,
             test_results_by_repo=test_results_by_repo or None,
             progress_cb=progress,
+            feature=job_feature,   # enables .ai-collab/handoffs/<feature>.md discovery
         )
 
         if len(prepared) == 1:

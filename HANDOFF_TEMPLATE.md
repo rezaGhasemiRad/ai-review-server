@@ -1,8 +1,13 @@
-# Handoff: <branch name>
+# Handoff: <feature name>
 
 > Filled in by the implementing AI. Read by the reviewers (Claude + Codex).
-> Drop this file at the repo root as `HANDOFF.md` (or in `.ai-collab/HANDOFF.md`)
-> and commit it on the feature branch. The reviewers will pick it up automatically.
+> Commit this file on the feature branch at:
+>     .ai-collab/handoffs/<feature>.md
+> where <feature> is the `feature` label sent to the review server. A
+> per-feature path prevents a stale handoff from a previous feature being
+> inherited via a reused branch. The reviewers pick it up automatically.
+> (Legacy `HANDOFF.md` / `.ai-collab/HANDOFF.md` are still recognized as a
+> fallback, but the per-feature path is preferred.)
 
 ## Goal
 
