@@ -67,6 +67,7 @@ JOBS_LOCK = threading.Lock()
 
 REPO_URL_RE = re.compile(r"^(https://|git@)[\w.@:/\-~]+\.git$")
 SAFE_REF_RE = re.compile(r"^[A-Za-z0-9_./\-]+$")
+LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-]{0,63}$")
 
 
 # --------------------------------------------------------------------------- #
@@ -131,6 +132,22 @@ class ReviewRequest(BaseModel):
     # results into the reviewer context.
     run_tests: bool = True
     test_timeout_s: int = 900  # 15 min per repo (4 GB / 2 vCPU box)
+
+    # Organization labels — group jobs for history/filtering. On an
+    # iteration (previous_job_id set) these are inherited from the prior
+    # job if omitted, so the implementer only tags iteration 1.
+    project: Optional[str] = None
+    feature: Optional[str] = None
+
+    @field_validator("project", "feature")
+    @classmethod
+    def _check_label(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        v = v.strip()
+        if not LABEL_RE.match(v):
+            raise ValueError("project/feature must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+        return v
 
     @field_validator("repo_url")
     @classmethod
@@ -498,11 +515,27 @@ def submit_review(req: ReviewRequest, request: Request) -> JobSubmitted:
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
+    # Resolve project/feature: explicit values win; otherwise inherit from
+    # the prior job in an iteration chain.
+    project, feature = req.project, req.feature
+    if req.previous_job_id and (project is None or feature is None):
+        prior = None
+        with JOBS_LOCK:
+            prior = JOBS.get(req.previous_job_id)
+        if prior is None:
+            prior = _load_from_disk(req.previous_job_id)
+        if prior:
+            project = project or prior.get("project")
+            feature = feature or prior.get("feature")
+
     job_id = uuid.uuid4().hex
     job = {
         "job_id": job_id,
         "status": "queued",
         "created_at": _now(),
+        "project": project,
+        "feature": feature,
+        "previous_job_id": req.previous_job_id,
         "request": req.model_dump(),
     }
     with JOBS_LOCK:
@@ -510,7 +543,8 @@ def submit_review(req: ReviewRequest, request: Request) -> JobSubmitted:
     _persist(job)
     EXECUTOR.submit(_run_job, job_id)
     summary = ", ".join(f"{r.repo_url}@{r.branch}" for r in repos)
-    log.info("queued job %s across %d repo(s): %s", job_id, len(repos), summary)
+    log.info("queued job %s [project=%s feature=%s] across %d repo(s): %s",
+             job_id, project, feature, len(repos), summary)
     base_url = str(request.base_url).rstrip("/")
     return JobSubmitted(
         job_id=job_id, status="queued", status_url=f"{base_url}/reviews/{job_id}"
@@ -528,23 +562,90 @@ def get_review(job_id: str):
     return job
 
 
-@app.get("/reviews", dependencies=[Depends(require_bearer)])
-def list_reviews(limit: int = 20):
+def _iter_jobs():
+    """Yield every persisted job dict, newest first."""
     files = sorted(JOBS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-    out = []
-    for p in files[: max(1, min(limit, 100))]:
+    for p in files:
         try:
-            j = json.loads(p.read_text(encoding="utf-8"))
-            out.append({
-                "job_id": j.get("job_id"),
-                "status": j.get("status"),
-                "branch": j.get("request", {}).get("branch"),
-                "created_at": j.get("created_at"),
-                "completed_at": j.get("completed_at"),
-            })
+            yield json.loads(p.read_text(encoding="utf-8"))
         except Exception:
             continue
-    return {"jobs": out}
+
+
+def _repo_names(job: dict) -> list[str]:
+    """Compact list of repo identifiers from a job's request."""
+    req = job.get("request", {})
+    if req.get("repos"):
+        return [r.get("repo_url", "?") for r in req["repos"]]
+    if req.get("repo_url"):
+        return [req["repo_url"]]
+    return []
+
+
+def _extract_verdict(review_md: Optional[str]) -> Optional[str]:
+    """Best-effort pull of the `Verdict:` line from a structured review."""
+    if not review_md:
+        return None
+    m = re.search(r"\*{0,2}Verdict:?\*{0,2}\s*`?([A-Za-z\-]+)`?", review_md)
+    return m.group(1).lower() if m else None
+
+
+def _job_summary(job: dict) -> dict:
+    result = job.get("result") or {}
+    return {
+        "job_id": job.get("job_id"),
+        "status": job.get("status"),
+        "project": job.get("project"),
+        "feature": job.get("feature"),
+        "previous_job_id": job.get("previous_job_id"),
+        "repos": _repo_names(job),
+        "created_at": job.get("created_at"),
+        "completed_at": job.get("completed_at"),
+        "claude_verdict": _extract_verdict(result.get("claude_review")),
+        "codex_verdict": _extract_verdict(result.get("codex_review")),
+        "error": job.get("error"),
+    }
+
+
+@app.get("/reviews", dependencies=[Depends(require_bearer)])
+def list_reviews(limit: int = 20, project: Optional[str] = None,
+                 feature: Optional[str] = None):
+    """List recent jobs, newest first. Optionally filter by project/feature."""
+    out = []
+    cap = max(1, min(limit, 200))
+    for j in _iter_jobs():
+        if project is not None and j.get("project") != project:
+            continue
+        if feature is not None and j.get("feature") != feature:
+            continue
+        out.append(_job_summary(j))
+        if len(out) >= cap:
+            break
+    return {"count": len(out), "jobs": out}
+
+
+@app.get("/features/{project}/{feature}", dependencies=[Depends(require_bearer)])
+def feature_timeline(project: str, feature: str):
+    """Ordered iteration history for one feature (oldest iteration first)."""
+    matches = [
+        j for j in _iter_jobs()
+        if j.get("project") == project and j.get("feature") == feature
+    ]
+    if not matches:
+        raise HTTPException(status_code=404,
+                            detail=f"no jobs for project={project} feature={feature}")
+    matches.sort(key=lambda j: j.get("created_at") or "")
+    iterations = []
+    for i, j in enumerate(matches, start=1):
+        s = _job_summary(j)
+        s["iteration"] = i
+        iterations.append(s)
+    return {
+        "project": project,
+        "feature": feature,
+        "iteration_count": len(iterations),
+        "iterations": iterations,
+    }
 
 
 @app.exception_handler(Exception)
