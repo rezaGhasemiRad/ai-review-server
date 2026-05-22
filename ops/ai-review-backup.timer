@@ -1,0 +1,9 @@
+[Unit]
+Description=Nightly S3 backup of the AI Review Server
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

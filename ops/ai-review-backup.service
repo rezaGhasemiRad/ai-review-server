@@ -1,0 +1,10 @@
+[Unit]
+Description=AI Review Server — S3 backup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+ExecStart=/home/ubuntu/ai-review-server/ops/backup.sh
