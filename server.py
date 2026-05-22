@@ -405,18 +405,20 @@ def _run_job(job_id: str) -> None:
         test_results_by_repo: dict = {}
         if req.get("run_tests", True):
             timeout_s = int(req.get("test_timeout_s") or 600)
-            progress(f"running Tier-1 tests ({len(prepared)} repo(s))")
-            log.info("running tests across %d repo(s), timeout=%ds each", len(prepared), timeout_s)
-            with ThreadPoolExecutor(max_workers=max(2, len(prepared))) as tpool:
-                futures = {
-                    p["repo_url"]: tpool.submit(_run_repo_tests, p["repo"], p["branch"], timeout_s)
-                    for p in prepared
-                }
-                for url, fut in futures.items():
-                    test_results_by_repo[url] = fut.result()
-            for url, tr in test_results_by_repo.items():
+            log.info("running tests SEQUENTIALLY across %d repo(s), timeout=%ds each",
+                     len(prepared), timeout_s)
+            # Sequential, not parallel: a Tier-1 run can be a full `next build`
+            # (~1.5 GB RAM, CPU-bound). Running N of them at once overcommits
+            # the box (load 9, OOM). One at a time, each build gets the whole
+            # machine — faster per build and never thrashes.
+            for i, p in enumerate(prepared, 1):
+                short = _short_repo(p["repo_url"])
+                progress(f"Tier-1 tests ({i}/{len(prepared)}): {short}")
+                tr = _run_repo_tests(p["repo"], p["branch"], timeout_s)
+                test_results_by_repo[p["repo_url"]] = tr
                 log.info("test result %s: status=%s exit=%s dur=%ss",
-                         url, tr.get("status"), tr.get("exit_code"), tr.get("duration_s"))
+                         p["repo_url"], tr.get("status"), tr.get("exit_code"),
+                         tr.get("duration_s"))
 
         progress("starting review")
         common = dict(
