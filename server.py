@@ -604,6 +604,14 @@ def _repo_names(job: dict) -> list[str]:
     return []
 
 
+def _short_repo(url: str) -> str:
+    """`git@github.com:owner/Thabbit.git` -> `Thabbit`."""
+    name = (url or "").rstrip("/").rsplit("/", 1)[-1]
+    if name.endswith(".git"):
+        name = name[:-4]
+    return name
+
+
 def _extract_verdict(review_md: Optional[str]) -> Optional[str]:
     """Best-effort pull of the `Verdict:` line from a structured review."""
     if not review_md:
@@ -660,7 +668,10 @@ def list_reviews(limit: int = 25, offset: int = 0,
         if feature is not None and j.get("feature") != feature:
             continue
         if repo_q is not None:
-            if not any(repo_q in n.lower() for n in _repo_names(j)):
+            names = _repo_names(j)
+            shorts = [_short_repo(n).lower() for n in names]
+            # exact short-name match (dropdown) OR substring of a full URL
+            if repo_q not in shorts and not any(repo_q in n.lower() for n in names):
                 continue
         matched.append(j)
     page = matched[offset:offset + limit]
@@ -671,6 +682,20 @@ def list_reviews(limit: int = 25, offset: int = 0,
         "count": len(page),
         "jobs": [_job_summary(j) for j in page],
     }
+
+
+@app.get("/repos", dependencies=[Depends(require_bearer)])
+def list_repos():
+    """Distinct repositories that appear across all jobs (for the filter UI)."""
+    seen: dict[str, str] = {}
+    for j in _iter_jobs():
+        for url in _repo_names(j):
+            seen.setdefault(_short_repo(url), url)
+    repos = sorted(
+        ({"name": n, "url": u} for n, u in seen.items()),
+        key=lambda r: r["name"].lower(),
+    )
+    return {"repos": repos}
 
 
 def _set_archived(job_id: str, value: bool) -> dict:

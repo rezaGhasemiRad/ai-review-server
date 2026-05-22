@@ -120,7 +120,9 @@
         <span style="width:8px"></span>
         <input id="fProject" placeholder="project" oninput="debouncedRefresh()">
         <input id="fFeature" placeholder="feature" oninput="debouncedRefresh()">
-        <input id="fRepo" placeholder="repo" oninput="debouncedRefresh()">
+        <select id="fRepo" onchange="debouncedRefresh()">
+          <option value="">All repos</option>
+        </select>
         <span style="flex:1"></span>
         <label class="muted">Per page
           <select id="perPage" onchange="changePerPage()">
@@ -229,9 +231,19 @@ async function archiveJob(id, archive){
   if(openJobId===id) loadDetail(); else loadList();
 }
 
+async function loadRepos(){
+  try {
+    const d = await api('/repos');
+    const sel = $('fRepo'), cur = sel.value;
+    sel.innerHTML = '<option value="">All repos</option>' +
+      d.repos.map(r=>'<option value="'+esc(r.name)+'">'+esc(r.name)+'</option>').join('');
+    sel.value = cur;  // preserve current selection across refreshes
+  } catch(e){ /* non-fatal */ }
+}
+
 async function loadList(){
   const p=$('fProject').value.trim(), f=$('fFeature').value.trim(),
-        rp=$('fRepo').value.trim();
+        rp=$('fRepo').value;
   let q='/reviews?limit='+perPage+'&offset='+(page*perPage)+'&archived='+showArchived;
   if(p) q+='&project='+encodeURIComponent(p);
   if(f) q+='&feature='+encodeURIComponent(f);
@@ -400,6 +412,7 @@ async function boot(){
   try { await api('/reviews?limit=1'); }
   catch(e){ return; }   // gate already shown
   gate(false);
+  await loadRepos();    // populate the repo filter dropdown
   await applyRoute();   // respect #job/<id> if the page was opened on a job URL
   startAuto();
 }
