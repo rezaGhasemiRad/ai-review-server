@@ -39,6 +39,9 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
+import urllib.parse
+import urllib.request
+
 import ai_chat  # the structured review function lives here
 
 log = logging.getLogger("review_server")
@@ -57,6 +60,67 @@ if not API_KEY:
     )
 if len(API_KEY) < 24:
     log.warning("REVIEW_SERVER_API_KEY is shorter than 24 chars — consider rotating.")
+
+# Persisted location of the API key — rewritten by the /rotate Telegram
+# command so a rotation survives a restart.
+SERVER_ENV = pathlib.Path.home() / ".ai-review-server.env"
+KEY_LOCK = threading.Lock()
+
+# Telegram bot config (bot token, chat id, webhook secret) lives in the
+# alerts env file. Read once at startup; the webhook endpoint is inert
+# until all three are present.
+ALERTS_ENV = pathlib.Path.home() / ".ai-review-alerts.env"
+
+
+def _load_env_file(path: pathlib.Path) -> dict:
+    cfg: dict[str, str] = {}
+    if path.exists():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                cfg[k.strip()] = v.strip()
+    return cfg
+
+
+TELEGRAM = _load_env_file(ALERTS_ENV)
+
+
+def _telegram_reply(text: str) -> None:
+    """Send a message back to the configured Telegram chat."""
+    tok = TELEGRAM.get("TELEGRAM_BOT_TOKEN")
+    chat = TELEGRAM.get("TELEGRAM_CHAT_ID")
+    if not tok or not chat:
+        return
+    data = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode()
+    try:
+        urllib.request.urlopen(
+            f"https://api.telegram.org/bot{tok}/sendMessage", data=data, timeout=15
+        )
+    except Exception:
+        log.exception("telegram reply failed")
+
+
+def _rotate_api_key() -> str:
+    """Generate a new API key, persist it to SERVER_ENV, swap it in live."""
+    global API_KEY
+    new = secrets.token_urlsafe(32)
+    with KEY_LOCK:
+        lines, found = [], False
+        if SERVER_ENV.exists():
+            for line in SERVER_ENV.read_text(encoding="utf-8").splitlines():
+                if line.startswith("REVIEW_SERVER_API_KEY="):
+                    lines.append(f"REVIEW_SERVER_API_KEY={new}")
+                    found = True
+                else:
+                    lines.append(line)
+        if not found:
+            lines.append(f"REVIEW_SERVER_API_KEY={new}")
+        SERVER_ENV.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        os.chmod(SERVER_ENV, 0o600)
+        API_KEY = new
+    log.warning("API key rotated via Telegram command")
+    return new
 
 # One review at a time. Reviews are token-expensive and the underlying CLIs
 # (claude / codex) are not designed for high concurrency.
@@ -518,6 +582,54 @@ app = FastAPI(
 @app.get("/healthz")
 def healthz():
     return {"status": "ok", "time": _now()}
+
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(request: Request):
+    """Telegram bot command endpoint — handles /token and /rotate.
+
+    Auth: the Telegram-supplied secret-token header must match
+    TELEGRAM_WEBHOOK_SECRET, AND the message must come from the
+    configured chat id. No bearer token (Telegram has none).
+    """
+    secret = TELEGRAM.get("TELEGRAM_WEBHOOK_SECRET")
+    if not secret or request.headers.get(
+            "X-Telegram-Bot-Api-Secret-Token") != secret:
+        raise HTTPException(status_code=403, detail="forbidden")
+
+    try:
+        update = await request.json()
+    except Exception:
+        return {"ok": True}
+
+    msg = update.get("message") or update.get("edited_message") or {}
+    chat_id = str((msg.get("chat") or {}).get("id", ""))
+    text = (msg.get("text") or "").strip()
+    authorized = str(TELEGRAM.get("TELEGRAM_CHAT_ID", ""))
+
+    # Silently ignore anyone who isn't the configured operator.
+    if not chat_id or chat_id != authorized:
+        return {"ok": True}
+
+    cmd = text.split()[0].split("@")[0].lower() if text else ""
+    if cmd == "/token":
+        _telegram_reply(
+            "Current REVIEW_SERVER_API_KEY:\n\n" + API_KEY +
+            "\n\n(Use this to supply the existing key. /rotate makes a new one.)"
+        )
+    elif cmd == "/rotate":
+        new = _rotate_api_key()
+        _telegram_reply(
+            "API key rotated. New REVIEW_SERVER_API_KEY:\n\n" + new +
+            "\n\nThe old key is now dead — update anything using it (e.g. Manus)."
+        )
+    else:
+        _telegram_reply(
+            "AI Review Server bot. Commands:\n"
+            "/token  - show the current API key\n"
+            "/rotate - generate a new API key (invalidates the old one)"
+        )
+    return {"ok": True}
 
 
 UI_FILE = ROOT / "ui" / "index.html"
