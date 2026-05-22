@@ -638,20 +638,30 @@ def _job_summary(job: dict) -> dict:
 
 
 @app.get("/reviews", dependencies=[Depends(require_bearer)])
-def list_reviews(limit: int = 20, project: Optional[str] = None,
-                 feature: Optional[str] = None):
-    """List recent jobs, newest first. Optionally filter by project/feature."""
-    out = []
-    cap = max(1, min(limit, 200))
+def list_reviews(limit: int = 25, offset: int = 0,
+                 project: Optional[str] = None, feature: Optional[str] = None):
+    """Paginated job list, newest first. Optionally filter by project/feature.
+
+    Returns `total` (matching jobs) so the client can page; `jobs` is the
+    `limit`-sized slice starting at `offset`.
+    """
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+    matched = []
     for j in _iter_jobs():
         if project is not None and j.get("project") != project:
             continue
         if feature is not None and j.get("feature") != feature:
             continue
-        out.append(_job_summary(j))
-        if len(out) >= cap:
-            break
-    return {"count": len(out), "jobs": out}
+        matched.append(j)
+    page = matched[offset:offset + limit]
+    return {
+        "total": len(matched),
+        "offset": offset,
+        "limit": limit,
+        "count": len(page),
+        "jobs": [_job_summary(j) for j in page],
+    }
 
 
 @app.get("/features/{project}/{feature}", dependencies=[Depends(require_bearer)])

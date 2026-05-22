@@ -28,6 +28,8 @@
   .btn { background:var(--blue); color:#fff; border:0; padding:9px 16px;
          border-radius:6px; cursor:pointer; font-size:14px; }
   .btn:hover { filter:brightness(1.08); }
+  .btn:disabled { opacity:.4; cursor:default; filter:none; }
+  .pager { display:flex; gap:12px; align-items:center; justify-content:center; }
   .filters { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
   .filters input { padding:7px 10px; border:1px solid var(--line); border-radius:6px; }
   table { width:100%; border-collapse:collapse; }
@@ -121,6 +123,11 @@
         </table>
         <div id="listEmpty" class="empty" style="display:none">No jobs.</div>
       </div>
+      <div class="card pager">
+        <button id="pgPrev" class="btn" onclick="pg(-1)">&lsaquo; Prev</button>
+        <span id="pgInfo" class="muted"></span>
+        <button id="pgNext" class="btn" onclick="pg(1)">Next &rsaquo;</button>
+      </div>
     </div>
 
     <div id="detailView" style="display:none">
@@ -185,14 +192,25 @@ function renderFindings(findings){
   }).join('');
 }
 
-// --- list view ---
+// --- list view (paginated) ---
+const PAGE_SIZE = 25;
+let page = 0;
+function pg(delta){ page = Math.max(0, page+delta); loadList(); }
+
 async function loadList(){
   const p=$('fProject').value.trim(), f=$('fFeature').value.trim();
-  let q='/reviews?limit=100';
+  let q='/reviews?limit='+PAGE_SIZE+'&offset='+(page*PAGE_SIZE);
   if(p) q+='&project='+encodeURIComponent(p);
   if(f) q+='&feature='+encodeURIComponent(f);
   const d = await api(q);
-  $('count').textContent = d.count+' job'+(d.count===1?'':'s');
+  const total = d.total||0;
+  const maxPage = Math.max(0, Math.ceil(total/PAGE_SIZE)-1);
+  if(page>maxPage){ page=maxPage; return loadList(); }  // clamp after filter change
+  const from = total ? d.offset+1 : 0, to = d.offset + d.count;
+  $('count').textContent = total ? (from+'–'+to+' of '+total) : '0 jobs';
+  $('pgPrev').disabled = page<=0;
+  $('pgNext').disabled = page>=maxPage;
+  $('pgInfo').textContent = total ? ('Page '+(page+1)+' of '+(maxPage+1)) : '';
   const rows = d.jobs.map(j=>{
     const repos = j.repos.map(shortRepo).join(', ') || '—';
     const pf = (j.project||'—')+' / '+(j.feature||'—');
@@ -321,7 +339,8 @@ async function loadDetail(){
 
 // --- refresh loop ---
 let dbTimer=null;
-function debouncedRefresh(){ clearTimeout(dbTimer); dbTimer=setTimeout(refresh,400); }
+function debouncedRefresh(){ clearTimeout(dbTimer);
+  dbTimer=setTimeout(()=>{ page=0; refresh(); },400); }
 async function refresh(){
   try {
     if(openJobId) await loadDetail(); else await loadList();
