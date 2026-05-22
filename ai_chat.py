@@ -514,8 +514,10 @@ def _run_review_pipeline(
     extra_context: str,
     prior_result: dict | None = None,
     test_results_by_repo: dict | None = None,
+    progress_cb=None,
 ) -> dict:
     """Two-phase review pipeline shared by the CLI and the HTTP server."""
+    cb = progress_cb if callable(progress_cb) else (lambda _m: None)
     context_block = f"# Context\n{extra_context}\n\n" if extra_context else ""
 
     prior_block = _build_prior_iteration_section(prior_result)
@@ -558,11 +560,13 @@ def _run_review_pipeline(
     history: list[dict] = [{"speaker": "system", "text": f"Subject: {label}\n\n{payload}"}]
 
     info("phase 1/2 — independent reviews")
+    cb("phase 1/2 · Claude reviewing")
     info("claude reviewing...")
     claude_review = call_claude(roles["claude"], initial_msg)
     speak("claude", claude_review)
     history.append({"speaker": "claude (initial)", "text": claude_review})
 
+    cb("phase 1/2 · Codex reviewing")
     info("codex reviewing...")
     codex_review = call_codex(roles["codex"], initial_msg)
     speak("codex", codex_review)
@@ -585,15 +589,18 @@ def _run_review_pipeline(
         f"points both reviews already agree on."
     )
 
+    cb("phase 2/2 · Claude reconciling")
     info("claude reconciling...")
     claude_reconcile = call_claude(roles["claude"], reconcile_msg)
     speak("claude", claude_reconcile)
     history.append({"speaker": "claude (reconcile)", "text": claude_reconcile})
 
+    cb("phase 2/2 · Codex reconciling")
     info("codex reconciling...")
     codex_reconcile = call_codex(roles["codex"], reconcile_msg)
     speak("codex", codex_reconcile)
     history.append({"speaker": "codex (reconcile)", "text": codex_reconcile})
+    cb("finalizing")
 
     transcript_path = save_transcript("review", label, history)
     transcript_md = transcript_path.read_text(encoding="utf-8")
@@ -639,6 +646,7 @@ def review_multi_repo_structured(
     summary_only: bool = False,
     prior_result: dict | None = None,
     test_results_by_repo: dict | None = None,
+    progress_cb=None,
 ) -> dict:
     """Run a single review whose subject is changes across multiple repos.
 
@@ -717,6 +725,7 @@ def review_multi_repo_structured(
     result = _run_review_pipeline(
         roles, label, combined_payload, extra_context,
         prior_result=prior_result, test_results_by_repo=test_results_by_repo,
+        progress_cb=progress_cb,
     )
     result["handoff_source"] = handoff_source
     result["request"] = {
@@ -743,6 +752,7 @@ def review_branch_structured(
     context: str | None = None,
     prior_result: dict | None = None,
     test_results_by_repo: dict | None = None,
+    progress_cb=None,
 ) -> dict:
     """Server-friendly entrypoint. Runs a branch review and returns a structured result.
 
@@ -775,6 +785,7 @@ def review_branch_structured(
     result = _run_review_pipeline(
         roles, label, payload, extra_context,
         prior_result=prior_result, test_results_by_repo=test_results_by_repo,
+        progress_cb=progress_cb,
     )
     result["handoff_source"] = handoff_source
     result["request"] = {

@@ -36,7 +36,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
 import ai_chat  # the structured review function lives here
@@ -365,10 +365,13 @@ def _ensure_repo(url: str) -> pathlib.Path:
 # --------------------------------------------------------------------------- #
 
 def _run_job(job_id: str) -> None:
+    def progress(msg: str) -> None:
+        _update(job_id, progress=msg)
+
     try:
         with JOBS_LOCK:
             req = dict(JOBS[job_id]["request"])
-        _update(job_id, status="running", started_at=_now())
+        _update(job_id, status="running", started_at=_now(), progress="cloning repositories")
 
         repos_in = req.get("repos") or []
         if not repos_in:
@@ -402,6 +405,7 @@ def _run_job(job_id: str) -> None:
         test_results_by_repo: dict = {}
         if req.get("run_tests", True):
             timeout_s = int(req.get("test_timeout_s") or 600)
+            progress(f"running Tier-1 tests ({len(prepared)} repo(s))")
             log.info("running tests across %d repo(s), timeout=%ds each", len(prepared), timeout_s)
             with ThreadPoolExecutor(max_workers=max(2, len(prepared))) as tpool:
                 futures = {
@@ -414,6 +418,7 @@ def _run_job(job_id: str) -> None:
                 log.info("test result %s: status=%s exit=%s dur=%ss",
                          url, tr.get("status"), tr.get("exit_code"), tr.get("duration_s"))
 
+        progress("starting review")
         common = dict(
             only_globs=req.get("only", []),
             include_all=req.get("include_all", False),
@@ -423,6 +428,7 @@ def _run_job(job_id: str) -> None:
             context=req.get("context"),
             prior_result=prior_result,
             test_results_by_repo=test_results_by_repo or None,
+            progress_cb=progress,
         )
 
         if len(prepared) == 1:
@@ -435,7 +441,10 @@ def _run_job(job_id: str) -> None:
                 repos=prepared, **common,
             )
 
-        _update(job_id, status="complete", completed_at=_now(), result=result)
+        if test_results_by_repo:
+            result["test_results"] = test_results_by_repo
+        _update(job_id, status="complete", completed_at=_now(), result=result,
+                progress="done")
         log.info("job %s complete (%d repo(s))", job_id, len(prepared))
     except SystemExit as e:
         # ai_chat helpers use sys.exit for input errors; convert to job failure.
@@ -504,6 +513,19 @@ app = FastAPI(
 @app.get("/healthz")
 def healthz():
     return {"status": "ok", "time": _now()}
+
+
+UI_FILE = ROOT / "ui" / "index.html"
+
+
+@app.get("/", response_class=HTMLResponse)
+def dashboard():
+    """Serve the single-page dashboard. The page itself carries no data —
+    it prompts for the API key and calls the authenticated endpoints."""
+    if UI_FILE.exists():
+        return UI_FILE.read_text(encoding="utf-8")
+    return HTMLResponse("<h1>AI Review Server</h1><p>Dashboard not installed.</p>",
+                        status_code=200)
 
 
 @app.post("/reviews", response_model=JobSubmitted, status_code=202,

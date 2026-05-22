@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI Review Dashboard</title>
+<style>
+  :root {
+    --bg:#f6f7f9; --card:#fff; --ink:#1d2330; --muted:#6b7280; --line:#e3e6ea;
+    --blue:#2563eb; --green:#16a34a; --red:#dc2626; --amber:#d97706; --grey:#9ca3af;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;
+         background:var(--bg); color:var(--ink); }
+  header { background:var(--ink); color:#fff; padding:12px 20px; display:flex;
+           align-items:center; gap:16px; }
+  header h1 { font-size:16px; margin:0; font-weight:600; }
+  header .sp { flex:1; }
+  header button { background:#374151; color:#fff; border:0; padding:6px 12px;
+                  border-radius:6px; cursor:pointer; font-size:13px; }
+  header button:hover { background:#4b5563; }
+  .wrap { max-width:1100px; margin:20px auto; padding:0 20px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px;
+          padding:16px; margin-bottom:14px; }
+  .gate { max-width:420px; margin:80px auto; }
+  .gate input { width:100%; padding:10px; border:1px solid var(--line);
+                border-radius:6px; font-size:14px; margin:10px 0; }
+  .btn { background:var(--blue); color:#fff; border:0; padding:9px 16px;
+         border-radius:6px; cursor:pointer; font-size:14px; }
+  .btn:hover { filter:brightness(1.08); }
+  .filters { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .filters input { padding:7px 10px; border:1px solid var(--line); border-radius:6px; }
+  table { width:100%; border-collapse:collapse; }
+  th { text-align:left; font-size:12px; color:var(--muted); text-transform:uppercase;
+       letter-spacing:.04em; padding:8px 10px; border-bottom:2px solid var(--line); }
+  td { padding:10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  tr.row { cursor:pointer; }
+  tr.row:hover { background:#f0f4ff; }
+  .badge { display:inline-block; padding:2px 9px; border-radius:20px; font-size:12px;
+           font-weight:600; color:#fff; }
+  .b-queued{background:var(--grey);} .b-running{background:var(--blue);}
+  .b-complete{background:var(--green);} .b-error{background:var(--red);}
+  .verdict { font-size:12px; padding:1px 7px; border-radius:4px; font-weight:600; }
+  .v-approve{background:#dcfce7;color:#15803d;}
+  .v-requestchanges,.v-request-changes{background:#fef3c7;color:#b45309;}
+  .v-blocking{background:#fee2e2;color:#b91c1c;}
+  .muted { color:var(--muted); font-size:12px; }
+  .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; }
+  .progress { background:#eff6ff; border:1px solid #bfdbfe; color:#1e40af;
+              padding:10px 14px; border-radius:8px; font-weight:600;
+              display:flex; align-items:center; gap:10px; }
+  .spin { width:14px; height:14px; border:2px solid #bfdbfe; border-top-color:var(--blue);
+          border-radius:50%; animation:sp 0.8s linear infinite; }
+  @keyframes sp { to { transform:rotate(360deg); } }
+  .review { background:var(--card); border:1px solid var(--line); border-radius:10px;
+            margin-bottom:14px; }
+  .review h3 { margin:0; padding:12px 16px; border-bottom:1px solid var(--line);
+               font-size:14px; }
+  .review .body { padding:14px 16px; }
+  .review.claude h3 { color:#0e7490; } .review.codex h3 { color:#b45309; }
+  .md h4,.md .mh { font-weight:700; margin:14px 0 4px; }
+  .md code { background:#f1f3f5; padding:1px 5px; border-radius:4px;
+             font-family:ui-monospace,monospace; font-size:12px; }
+  .md pre.cb { background:#1e2330; color:#e6e9ef; padding:12px; border-radius:8px;
+               overflow-x:auto; font-size:12px; }
+  .md li { margin-left:18px; }
+  .testrow { display:flex; gap:10px; align-items:center; padding:6px 0;
+             border-bottom:1px solid var(--line); }
+  .t-passed{color:var(--green);} .t-failed,.t-timeout,.t-error{color:var(--red);}
+  .t-skipped{color:var(--muted);}
+  a.back { color:var(--blue); cursor:pointer; text-decoration:none; font-size:13px; }
+  details summary { cursor:pointer; color:var(--blue); font-size:13px; }
+  .empty { text-align:center; color:var(--muted); padding:40px; }
+</style>
+</head>
+<body>
+
+<div id="gate" class="gate card" style="display:none">
+  <h2 style="margin-top:0">AI Review Dashboard</h2>
+  <p class="muted">Enter the server API key to continue. It is stored only in this browser.</p>
+  <input id="keyInput" type="password" placeholder="Bearer API key" autocomplete="off">
+  <button class="btn" onclick="saveKey()">Connect</button>
+  <p id="gateErr" style="color:var(--red);display:none">Invalid key.</p>
+</div>
+
+<div id="app" style="display:none">
+  <header>
+    <h1>AI Review Dashboard</h1>
+    <span class="sp"></span>
+    <span id="autostat" class="muted" style="color:#9ca3af"></span>
+    <button onclick="refresh()">Refresh</button>
+    <button onclick="clearKey()">Change key</button>
+  </header>
+  <div class="wrap">
+    <div id="listView">
+      <div class="card filters">
+        <strong>Filter:</strong>
+        <input id="fProject" placeholder="project" oninput="debouncedRefresh()">
+        <input id="fFeature" placeholder="feature" oninput="debouncedRefresh()">
+        <span id="count" class="muted"></span>
+      </div>
+      <div class="card" style="padding:0">
+        <table>
+          <thead><tr>
+            <th>Status</th><th>Project / Feature</th><th>Repos</th>
+            <th>Verdicts</th><th>Created</th>
+          </tr></thead>
+          <tbody id="jobRows"></tbody>
+        </table>
+        <div id="listEmpty" class="empty" style="display:none">No jobs.</div>
+      </div>
+    </div>
+
+    <div id="detailView" style="display:none">
+      <p><a class="back" onclick="showList()">&larr; All jobs</a></p>
+      <div id="detailBody"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let KEY = localStorage.getItem('ai_review_key') || '';
+let openJobId = null;
+let refreshTimer = null;
+
+function gate(show){ $('gate').style.display = show?'block':'none';
+                     $('app').style.display = show?'none':'block'; }
+function saveKey(){ KEY = $('keyInput').value.trim();
+                    localStorage.setItem('ai_review_key', KEY); boot(); }
+function clearKey(){ localStorage.removeItem('ai_review_key'); KEY=''; gate(true); }
+
+async function api(path){
+  const r = await fetch(path, { headers:{ 'Authorization':'Bearer '+KEY } });
+  if(r.status===401||r.status===403){ $('gateErr').style.display='block';
+                                      gate(true); throw new Error('auth'); }
+  if(!r.ok) throw new Error('HTTP '+r.status);
+  return r.json();
+}
+
+// --- markdown-lite (escape first => XSS-safe) ---
+function renderMd(t){
+  if(!t) return '<span class="muted">(none)</span>';
+  let h = t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  h = h.replace(/```[\w]*\n?([\s\S]*?)```/g,(m,c)=>'<pre class="cb">'+c+'</pre>');
+  h = h.replace(/^#{1,6}\s*(.+)$/gm,'<div class="mh">$1</div>');
+  h = h.replace(/\*\*(.+?)\*\*/g,'<b>$1</b>');
+  h = h.replace(/`([^`]+)`/g,'<code>$1</code>');
+  h = h.replace(/^\s*[-*]\s+(.+)$/gm,'<li>$1</li>');
+  h = h.replace(/\n/g,'<br>');
+  return h;
+}
+function esc(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
+function fmt(ts){ return ts ? ts.replace('T',' ').replace('Z',' UTC') : '—'; }
+function shortRepo(u){ return (u||'').replace(/^.*[:/]/,'').replace(/\.git$/,''); }
+
+function verdictTag(v){
+  if(!v) return '';
+  const cls = 'v-'+v.replace(/[^a-z]/g,'');
+  return '<span class="verdict '+cls+'">'+esc(v)+'</span>';
+}
+
+// --- list view ---
+async function loadList(){
+  const p=$('fProject').value.trim(), f=$('fFeature').value.trim();
+  let q='/reviews?limit=100';
+  if(p) q+='&project='+encodeURIComponent(p);
+  if(f) q+='&feature='+encodeURIComponent(f);
+  const d = await api(q);
+  $('count').textContent = d.count+' job'+(d.count===1?'':'s');
+  const rows = d.jobs.map(j=>{
+    const repos = j.repos.map(shortRepo).join(', ') || '—';
+    const pf = (j.project||'—')+' / '+(j.feature||'—');
+    let statusCell = '<span class="badge b-'+j.status+'">'+j.status+'</span>';
+    if(j.status==='running'||j.status==='queued')
+      statusCell += '<div class="muted">'+esc(j.progress||'')+'</div>';
+    const verdicts = (j.claude_verdict||j.codex_verdict)
+      ? 'C:'+verdictTag(j.claude_verdict)+' X:'+verdictTag(j.codex_verdict) : '—';
+    return '<tr class="row" onclick="openDetail(\''+j.job_id+'\')">'+
+      '<td>'+statusCell+'</td>'+
+      '<td>'+esc(pf)+'</td>'+
+      '<td class="mono">'+esc(repos)+'</td>'+
+      '<td>'+verdicts+'</td>'+
+      '<td class="muted">'+fmt(j.created_at)+'</td></tr>';
+  }).join('');
+  $('jobRows').innerHTML = rows;
+  $('listEmpty').style.display = d.count? 'none':'block';
+}
+
+// --- detail view ---
+async function openDetail(id){
+  openJobId = id;
+  $('listView').style.display='none';
+  $('detailView').style.display='block';
+  await loadDetail();
+}
+function showList(){ openJobId=null;
+  $('detailView').style.display='none';
+  $('listView').style.display='block'; loadList(); }
+
+async function loadDetail(){
+  const j = await api('/reviews/'+openJobId);
+  const r = j.result || {};
+  let h = '';
+  h += '<div class="card"><div style="display:flex;gap:12px;align-items:center">'+
+    '<span class="badge b-'+j.status+'">'+j.status+'</span>'+
+    '<strong>'+esc((j.project||'—')+' / '+(j.feature||'—'))+'</strong>'+
+    '<span class="mono muted">'+j.job_id+'</span></div>';
+  if(j.status==='running'||j.status==='queued')
+    h += '<div class="progress" style="margin-top:10px"><div class="spin"></div>'+
+         esc(j.progress||'working...')+'</div>';
+  if(j.status==='error')
+    h += '<div class="progress" style="margin-top:10px;background:#fee2e2;'+
+         'border-color:#fca5a5;color:#b91c1c">Error: '+esc(j.error||'unknown')+'</div>';
+  const req = j.request||{};
+  const repoList = (req.repos||(req.repo_url?[{repo_url:req.repo_url,branch:req.branch,base:req.base}]:[]));
+  h += '<div style="margin-top:10px" class="muted">created '+fmt(j.created_at)+
+       ' · started '+fmt(j.started_at)+' · completed '+fmt(j.completed_at);
+  if(j.previous_job_id) h+=' · <a class="back" onclick="openDetail(\''+j.previous_job_id+'\')">prev iteration</a>';
+  h += '</div>';
+  h += '<div style="margin-top:8px">'+repoList.map(x=>
+       '<div class="mono">'+esc(shortRepo(x.repo_url))+' &nbsp; '+
+       esc(x.branch||'')+' &larr; '+esc(x.base||'')+'</div>').join('')+'</div>';
+  h += '</div>';
+
+  // test results
+  if(r.test_results){
+    h += '<div class="card"><h3 style="margin:0 0 8px">Tier-1 test results</h3>';
+    for(const [repo,t] of Object.entries(r.test_results)){
+      h += '<div class="testrow"><span class="t-'+t.status+'" style="font-weight:600">'+
+           t.status+'</span><span class="mono">'+esc(shortRepo(repo))+'</span>'+
+           '<span class="muted">'+(t.duration_s!=null?t.duration_s+'s':'')+
+           (t.exit_code!=null?' · exit '+t.exit_code:'')+
+           (t.reason?' · '+esc(t.reason):'')+'</span></div>';
+    }
+    h += '</div>';
+  }
+
+  // the four AI communications
+  const blocks = [
+    ['claude','Claude — Review', r.claude_review],
+    ['codex','Codex — Review', r.codex_review],
+    ['claude','Claude — Reconciliation', r.claude_reconcile],
+    ['codex','Codex — Reconciliation', r.codex_reconcile],
+  ];
+  for(const [who,title,txt] of blocks){
+    if(txt===undefined && j.status!=='complete') continue;
+    h += '<div class="review '+who+'"><h3>'+title+'</h3>'+
+         '<div class="body md">'+renderMd(txt)+'</div></div>';
+  }
+  if(r.transcript_md){
+    h += '<div class="card"><details><summary>Full transcript</summary>'+
+         '<div class="md" style="margin-top:10px">'+renderMd(r.transcript_md)+'</div></details></div>';
+  }
+  $('detailBody').innerHTML = h;
+}
+
+// --- refresh loop ---
+let dbTimer=null;
+function debouncedRefresh(){ clearTimeout(dbTimer); dbTimer=setTimeout(refresh,400); }
+async function refresh(){
+  try {
+    if(openJobId) await loadDetail(); else await loadList();
+    $('autostat').textContent = 'updated '+new Date().toLocaleTimeString();
+  } catch(e){ /* auth errors handled in api() */ }
+}
+function startAuto(){
+  if(refreshTimer) clearInterval(refreshTimer);
+  refreshTimer = setInterval(refresh, 6000);  // 6s auto-refresh
+}
+
+async function boot(){
+  if(!KEY){ gate(true); return; }
+  try { await api('/reviews?limit=1'); }
+  catch(e){ return; }   // gate already shown
+  gate(false);
+  await refresh();
+  startAuto();
+}
+boot();
+</script>
+</body>
+</html>
