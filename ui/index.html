@@ -109,7 +109,7 @@
     <h1>AI Review Dashboard</h1>
     <span class="sp"></span>
     <span id="autostat" class="muted" style="color:#9ca3af"></span>
-    <button onclick="refresh()">Refresh</button>
+    <button onclick="refresh(true)">Refresh</button>
     <button onclick="clearKey()">Change key</button>
   </header>
   <div class="wrap">
@@ -163,6 +163,9 @@ const $ = id => document.getElementById(id);
 let KEY = localStorage.getItem('ai_review_key') || '';
 let openJobId = null;
 let refreshTimer = null;
+let openJobTerminal = false;  // true once the open job is complete/error —
+                              // stops the 6s auto-refresh from rebuilding the
+                              // detail DOM (which would collapse the transcript)
 
 function gate(show){ $('gate').style.display = show?'block':'none';
                      $('app').style.display = show?'none':'block'; }
@@ -293,6 +296,7 @@ async function applyRoute(){
   const h = location.hash.replace(/^#\/?/,'');
   if(h.indexOf('job/')===0){
     openJobId = h.slice(4);
+    openJobTerminal = false;   // force a render of the newly-opened job
     $('listView').style.display='none';
     $('detailView').style.display='block';
     await loadDetail();
@@ -307,6 +311,7 @@ window.addEventListener('hashchange', applyRoute);
 
 async function loadDetail(){
   const j = await api('/reviews/'+openJobId);
+  openJobTerminal = (j.status === 'complete' || j.status === 'error');
   const r = j.result || {};
   let h = '';
   const isArch = !!j.archived;
@@ -396,15 +401,23 @@ async function loadDetail(){
 let dbTimer=null;
 function debouncedRefresh(){ clearTimeout(dbTimer);
   dbTimer=setTimeout(()=>{ page=0; refresh(); },400); }
-async function refresh(){
+async function refresh(force){
   try {
-    if(openJobId) await loadDetail(); else await loadList();
+    if(openJobId){
+      // Skip auto-refresh of a finished job — nothing changes, and a
+      // re-render would collapse the transcript / lose scroll position.
+      // The manual Refresh button passes force=true to override.
+      if(openJobTerminal && !force) return;
+      await loadDetail();
+    } else {
+      await loadList();
+    }
     $('autostat').textContent = 'updated '+new Date().toLocaleTimeString();
   } catch(e){ /* auth errors handled in api() */ }
 }
 function startAuto(){
   if(refreshTimer) clearInterval(refreshTimer);
-  refreshTimer = setInterval(refresh, 6000);  // 6s auto-refresh
+  refreshTimer = setInterval(()=>refresh(false), 6000);  // 6s auto-refresh
 }
 
 async function boot(){
