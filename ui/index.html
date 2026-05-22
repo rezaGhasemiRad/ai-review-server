@@ -216,16 +216,26 @@ async function loadList(){
   $('listEmpty').style.display = d.count? 'none':'block';
 }
 
-// --- detail view ---
-async function openDetail(id){
-  openJobId = id;
-  $('listView').style.display='none';
-  $('detailView').style.display='block';
-  await loadDetail();
+// --- routing: hash-based so every job has a copy-pasteable URL ---
+// #job/<id> opens that job; empty hash shows the list.
+function openDetail(id){ location.hash = '#job/'+id; }
+function showList(){ if(location.hash) location.hash=''; else applyRoute(); }
+
+async function applyRoute(){
+  const h = location.hash.replace(/^#\/?/,'');
+  if(h.indexOf('job/')===0){
+    openJobId = h.slice(4);
+    $('listView').style.display='none';
+    $('detailView').style.display='block';
+    await loadDetail();
+  } else {
+    openJobId = null;
+    $('detailView').style.display='none';
+    $('listView').style.display='block';
+    await loadList();
+  }
 }
-function showList(){ openJobId=null;
-  $('detailView').style.display='none';
-  $('listView').style.display='block'; loadList(); }
+window.addEventListener('hashchange', applyRoute);
 
 async function loadDetail(){
   const j = await api('/reviews/'+openJobId);
@@ -328,7 +338,7 @@ async function boot(){
   try { await api('/reviews?limit=1'); }
   catch(e){ return; }   // gate already shown
   gate(false);
-  await refresh();
+  await applyRoute();   // respect #job/<id> if the page was opened on a job URL
   startAuto();
 }
 boot();
