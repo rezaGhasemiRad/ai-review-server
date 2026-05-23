@@ -325,7 +325,22 @@ async function applyRoute(){
 window.addEventListener('hashchange', applyRoute);
 
 async function loadDetail(){
-  const j = await api('/reviews/'+openJobId);
+  let j;
+  try {
+    j = await api('/reviews/'+openJobId);
+  } catch(e) {
+    // Server-side serialization can fail for running jobs that have an
+    // unserializable Future attached (known bug). Show something useful
+    // instead of leaving the page blank.
+    $('detailBody').innerHTML =
+      '<div class="card"><h3 style="margin:0 0 8px">Could not load this job</h3>'+
+      '<p class="muted mono">'+esc(e.message||'')+' on /reviews/'+esc(openJobId)+'</p>'+
+      '<p class="muted">If the job is still running, the list view shows its progress. '+
+      'Refresh this page after it completes — once a job is persisted to disk the '+
+      'response works.</p></div>';
+    openJobTerminal = false;  // keep polling — completion will flip it
+    return;
+  }
   openJobTerminal = (j.status === 'complete' || j.status === 'error');
   const r = j.result || {};
   let h = '';
