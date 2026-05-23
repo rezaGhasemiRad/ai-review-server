@@ -89,6 +89,13 @@
   .sev-nit{background:#f1f3f5;color:#6b7280;}
   .fgrid { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
   @media(max-width:720px){ .fgrid{grid-template-columns:1fr;} }
+  .iter { display:flex; align-items:center; gap:10px; padding:7px 10px;
+          border:1px solid var(--line); border-radius:6px; text-decoration:none;
+          color:var(--ink); font-size:13px; }
+  .iter:hover { background:#f8f9fb; }
+  .iter.current { background:#eef4ff; border-color:#9ec5ff; font-weight:600; }
+  .iter .ord { font-weight:700; min-width:22px; }
+  .iter .vd { color:#6b7280; font-size:12px; }
   a.back { color:var(--blue); cursor:pointer; text-decoration:none; font-size:13px; }
   details summary { cursor:pointer; color:var(--blue); font-size:13px; }
   .empty { text-align:center; color:var(--muted); padding:40px; }
@@ -201,6 +208,27 @@ function verdictTag(v){
   if(!v) return '';
   const cls = 'v-'+v.replace(/[^a-z]/g,'');
   return '<span class="verdict '+cls+'">'+esc(v)+'</span>';
+}
+function renderIterations(iters, currentId){
+  if(!iters || iters.length<=1) return '';
+  const rows = iters.map(it=>{
+    const cur = it.job_id===currentId;
+    const cv = it.claude_verdict, xv = it.codex_verdict;
+    const verd = (cv||xv)
+      ? '<span class="vd">C:'+esc(cv||'?')+' &nbsp; X:'+esc(xv||'?')+'</span>'
+      : '';
+    return '<a class="iter'+(cur?' current':'')+'" href="#job/'+esc(it.job_id)+'">'+
+      '<span class="ord">#'+it.iteration+'</span>'+
+      '<span class="badge b-'+it.status+'">'+it.status+'</span>'+
+      '<span class="muted mono" style="font-size:12px">'+fmt(it.created_at)+'</span>'+
+      verd+
+      (cur?'<span class="muted" style="margin-left:auto">(this one)</span>':'')+
+      '</a>';
+  }).join('');
+  return '<div class="card"><h3 style="margin:0 0 10px">Feature timeline · '+
+    iters.length+' iteration'+(iters.length===1?'':'s')+
+    '</h3><div style="display:flex;flex-direction:column;gap:6px">'+
+    rows+'</div></div>';
 }
 function renderFindings(findings){
   if(!findings || !findings.length) return '<span class="muted">none</span>';
@@ -387,6 +415,15 @@ async function loadDetail(){
       '</div>';
   }
   h += '</div>';
+
+  // feature timeline — only when tagged AND more than one iteration exists
+  if(j.project && j.feature){
+    try {
+      const t = await api('/features/'+encodeURIComponent(j.project)+
+                          '/'+encodeURIComponent(j.feature));
+      h += renderIterations(t.iterations, j.job_id);
+    } catch(e){ /* untagged or solo iteration — silent */ }
+  }
 
   // findings
   if(r.claude_findings || r.codex_findings){
