@@ -233,6 +233,17 @@ async function archiveJob(id, archive){
     { method:'POST', headers:{ 'Authorization':'Bearer '+KEY } });
   if(openJobId===id) loadDetail(); else loadList();
 }
+async function cancelJob(id){
+  if(!confirm('Cancel this queued job? It will be marked errored.')) return;
+  const r = await fetch('/reviews/'+id+'/cancel',
+    { method:'POST', headers:{ 'Authorization':'Bearer '+KEY } });
+  if(!r.ok){
+    let msg = 'HTTP '+r.status;
+    try { msg = (await r.json()).detail || msg; } catch(e){}
+    alert('Could not cancel: '+msg);
+  }
+  if(openJobId===id) loadDetail(); else loadList();
+}
 
 async function loadRepos(){
   try {
@@ -275,13 +286,17 @@ async function loadList(){
     const archBtn = '<button class="mini" onclick="event.stopPropagation();'+
       'archiveJob(\''+j.job_id+'\','+(showArchived?'false':'true')+')">'+
       (showArchived?'Restore':'Archive')+'</button>';
+    const cancelBtn = (j.status==='queued')
+      ? '<button class="mini" style="margin-right:6px" '+
+        'onclick="event.stopPropagation();cancelJob(\''+j.job_id+'\')">Cancel</button>'
+      : '';
     return '<tr class="row" onclick="openDetail(\''+j.job_id+'\')">'+
       '<td>'+statusCell+'</td>'+
       '<td>'+esc(pf)+'</td>'+
       '<td class="mono">'+esc(repos)+'</td>'+
       '<td>'+verdicts+'</td>'+
       '<td class="muted">'+fmt(j.created_at)+'</td>'+
-      '<td>'+archBtn+'</td></tr>';
+      '<td>'+cancelBtn+archBtn+'</td></tr>';
   }).join('');
   $('jobRows').innerHTML = rows;
   $('listEmpty').style.display = d.count? 'none':'block';
@@ -321,6 +336,9 @@ async function loadDetail(){
     '<span class="mono muted">'+j.job_id+'</span>'+
     (isArch?'<span class="muted">· archived</span>':'')+
     '<span style="flex:1"></span>'+
+    (j.status==='queued'
+      ? '<button class="mini" style="margin-right:6px" onclick="cancelJob(\''+j.job_id+'\')">Cancel</button>'
+      : '')+
     '<button class="mini" onclick="archiveJob(\''+j.job_id+'\','+(isArch?'false':'true')+')">'+
       (isArch?'Restore':'Archive')+'</button></div>';
   if(j.status==='running'||j.status==='queued')
