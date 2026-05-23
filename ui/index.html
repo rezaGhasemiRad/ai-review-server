@@ -211,7 +211,9 @@ function verdictTag(v){
 }
 function renderIterations(iters, currentId){
   if(!iters || iters.length<=1) return '';
-  const rows = iters.map(it=>{
+  // Server returns oldest-first (so iteration #1 = first). Reverse for
+  // display so the newest iteration is at the top; #N stays meaningful.
+  const rows = iters.slice().reverse().map(it=>{
     const cur = it.job_id===currentId;
     const cv = it.claude_verdict, xv = it.codex_verdict;
     const verd = (cv||xv)
