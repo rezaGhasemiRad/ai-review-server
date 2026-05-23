@@ -751,7 +751,9 @@ def get_review(job_id: str):
         job = _load_from_disk(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
-    return job
+    # Strip in-memory-only keys (e.g. _future from /cancel) — they aren't
+    # JSON-serializable and FastAPI would 500 otherwise.
+    return {k: v for k, v in job.items() if not k.startswith("_")}
 
 
 def _iter_jobs():
