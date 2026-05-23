@@ -101,6 +101,49 @@ def _telegram_reply(text: str) -> None:
         log.exception("telegram reply failed")
 
 
+def _job_link(job_id: str) -> str:
+    """Dashboard deep-link for a job. Empty if PUBLIC_URL isn't configured."""
+    base = (TELEGRAM.get("PUBLIC_URL") or "").rstrip("/")
+    if base.endswith("/healthz"):
+        base = base[: -len("/healthz")]
+    return f"{base}/#job/{job_id}" if base else ""
+
+
+def _notify_job_done(job_id: str) -> None:
+    """Send a Telegram summary when a job reaches a terminal state."""
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+    if job is None:
+        job = _load_from_disk(job_id) or {}
+    status = job.get("status")
+    if status not in ("complete", "error"):
+        return
+
+    pf = (job.get("project") or "—") + " / " + (job.get("feature") or "—")
+    link = _job_link(job_id)
+    result = job.get("result") or {}
+
+    if status == "complete":
+        cv = result.get("claude_verdict") or "?"
+        xv = result.get("codex_verdict") or "?"
+        cf = len(result.get("claude_findings") or [])
+        xf = len(result.get("codex_findings") or [])
+        cost = (result.get("usage") or {}).get("total_usd") or 0.0
+        body = (
+            f"Review COMPLETE — {pf}\n"
+            f"Claude: {cv} ({cf} findings)\n"
+            f"Codex:  {xv} ({xf} findings)\n"
+            f"Cost:   ${cost:.4f}\n"
+        )
+    else:
+        err = (job.get("error") or "").strip()
+        body = f"Review FAILED — {pf}\nError: {err[:300]}\n"
+
+    if link:
+        body += link
+    _telegram_reply(body)
+
+
 def _rotate_api_key() -> str:
     """Generate a new API key, persist it to SERVER_ENV, swap it in live."""
     global API_KEY
@@ -517,15 +560,18 @@ def _run_job(job_id: str) -> None:
         _update(job_id, status="complete", completed_at=_now(), result=result,
                 progress="done")
         log.info("job %s complete (%d repo(s))", job_id, len(prepared))
+        _notify_job_done(job_id)
     except SystemExit as e:
         # ai_chat helpers use sys.exit for input errors; convert to job failure.
         _update(job_id, status="error", completed_at=_now(),
                 error=str(e) or "input validation failed")
         log.warning("job %s failed (validation): %s", job_id, e)
+        _notify_job_done(job_id)
     except Exception as e:
         _update(job_id, status="error", completed_at=_now(),
                 error=f"{type(e).__name__}: {e}",
                 error_trace=traceback.format_exc())
+        _notify_job_done(job_id)
         log.exception("job %s failed", job_id)
 
 
@@ -889,6 +935,7 @@ def cancel_job(job_id: str):
                         "error": "cancelled by user", "completed_at": _now()}
             _persist(snapshot)
     log.info("job %s cancelled (future.cancel=%s)", job_id, cancelled)
+    _notify_job_done(job_id)
     return {"job_id": job_id, "status": "error",
             "future_cancelled": cancelled,
             "note": "queued job removed from queue" if cancelled
