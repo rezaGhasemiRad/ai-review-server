@@ -259,8 +259,10 @@ def _now() -> str:
 
 
 def _persist(job: dict) -> None:
+    # Drop in-memory-only keys (Future, etc.) before serializing.
+    clean = {k: v for k, v in job.items() if not k.startswith("_")}
     path = JOBS_DIR / f"{job['job_id']}.json"
-    path.write_text(json.dumps(job, indent=2, default=str), encoding="utf-8")
+    path.write_text(json.dumps(clean, indent=2, default=str), encoding="utf-8")
 
 
 def _update(job_id: str, **changes) -> dict:
@@ -680,7 +682,12 @@ def submit_review(req: ReviewRequest, request: Request) -> JobSubmitted:
     with JOBS_LOCK:
         JOBS[job_id] = job
     _persist(job)
-    EXECUTOR.submit(_run_job, job_id)
+    fut = EXECUTOR.submit(_run_job, job_id)
+    # Hold the Future in-memory so /cancel can call .cancel() on a queued job.
+    # The leading underscore keeps _persist from trying to serialize it.
+    with JOBS_LOCK:
+        if job_id in JOBS:
+            JOBS[job_id]["_future"] = fut
     summary = ", ".join(f"{r.repo_url}@{r.branch}" for r in repos)
     log.info("queued job %s [project=%s feature=%s] across %d repo(s): %s",
              job_id, project, feature, len(repos), summary)
@@ -839,6 +846,53 @@ def archive_job(job_id: str):
 def unarchive_job(job_id: str):
     _set_archived(job_id, False)
     return {"job_id": job_id, "archived": False}
+
+
+@app.post("/reviews/{job_id}/cancel", dependencies=[Depends(require_bearer)])
+def cancel_job(job_id: str):
+    """Cancel a queued review. Idempotent for terminal jobs.
+
+    Running jobs cannot be cancelled cleanly (the worker thread can't be
+    killed safely from outside) — returns 409 for those; restart the
+    service if you really need to stop a running job.
+    """
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+    if job is None:
+        job = _load_from_disk(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+
+    status = job.get("status")
+    if status in ("complete", "error"):
+        return {"job_id": job_id, "status": status, "note": "already terminal"}
+
+    if status == "running":
+        raise HTTPException(
+            status_code=409,
+            detail="cannot cancel a running job; let it finish or restart the server",
+        )
+
+    # status == "queued": try to remove from the executor's queue, then mark errored.
+    fut = job.get("_future") if isinstance(job, dict) else None
+    cancelled = fut.cancel() if fut else False
+    with JOBS_LOCK:
+        jr = JOBS.get(job_id)
+        if jr is not None:
+            jr["status"] = "error"
+            jr["error"] = "cancelled by user"
+            jr["completed_at"] = _now()
+            _persist(jr)
+            snapshot = dict(jr)
+        else:
+            snapshot = {"job_id": job_id, "status": "error",
+                        "error": "cancelled by user", "completed_at": _now()}
+            _persist(snapshot)
+    log.info("job %s cancelled (future.cancel=%s)", job_id, cancelled)
+    return {"job_id": job_id, "status": "error",
+            "future_cancelled": cancelled,
+            "note": "queued job removed from queue" if cancelled
+                    else "future could not be cancelled (already running?) — marked errored"}
 
 
 @app.get("/features/{project}/{feature}", dependencies=[Depends(require_bearer)])
