@@ -222,7 +222,10 @@ def _extract_findings_block(review_text: str) -> tuple[str, dict | None]:
     Never raises — a malformed block just yields None.
     """
     txt = review_text.strip()
-    m = re.search(r"```json\s*(\{.*\})\s*```\s*$", txt, re.DOTALL)
+    # Codex sometimes omits the closing ``` fence, so make it optional. The
+    # greedy {.*} still grabs through the final }; trailing whitespace / a
+    # stray fence at the end are tolerated.
+    m = re.search(r"```json\s*(\{.*\})\s*(?:```)?\s*$", txt, re.DOTALL)
     if not m:
         return review_text, None
     try:
