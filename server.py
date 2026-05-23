@@ -128,12 +128,14 @@ def _notify_job_done(job_id: str) -> None:
         xv = result.get("codex_verdict") or "?"
         cf = len(result.get("claude_findings") or [])
         xf = len(result.get("codex_findings") or [])
-        cost = (result.get("usage") or {}).get("total_usd") or 0.0
+        usage = result.get("usage") or {}
+        tin = usage.get("total_input_tokens") or 0
+        tout = usage.get("total_output_tokens") or 0
         body = (
             f"Review COMPLETE — {pf}\n"
             f"Claude: {cv} ({cf} findings)\n"
             f"Codex:  {xv} ({xf} findings)\n"
-            f"Cost:   ${cost:.4f}\n"
+            f"Tokens: {tin:,} in / {tout:,} out\n"
         )
     else:
         err = (job.get("error") or "").strip()
