@@ -32,7 +32,7 @@ import threading
 import time
 import traceback
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
@@ -170,6 +170,11 @@ def _rotate_api_key() -> str:
 # One review at a time. Reviews are token-expensive and the underlying CLIs
 # (claude / codex) are not designed for high concurrency.
 EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="reviewer")
+# Tests for a single review run on this executor — they overlap with the
+# review pipeline so wall time is max(tests, reviews) instead of tests + reviews.
+# One worker is enough: EXECUTOR is also serialized, so we never have two
+# jobs' tests in flight at the same time.
+TESTS_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tests")
 
 JOBS: dict[str, dict] = {}
 JOBS_LOCK = threading.Lock()
@@ -514,26 +519,39 @@ def _run_job(job_id: str) -> None:
                 log.warning("previous_job_id %s did not resolve to a completed job; ignoring",
                             req["previous_job_id"])
 
-        # Run per-repo tests in parallel (default on).
+        # Tests run on a background thread so the review pipeline can start
+        # in parallel. Tests are still SEQUENTIAL across repos within the
+        # thread (Tier-1 builds can be ~1.5 GB RAM each — running N at once
+        # OOMs the box). The thread fills a Future that ai_chat awaits just
+        # before the reconcile phase, so reviewers don't see test results
+        # during their initial pass but the reconciler does.
         test_results_by_repo: dict = {}
+        tests_future: Future | None = None
         if req.get("run_tests", True):
             timeout_s = int(req.get("test_timeout_s") or 600)
-            log.info("running tests SEQUENTIALLY across %d repo(s), timeout=%ds each",
+            log.info("running tests in BACKGROUND across %d repo(s), "
+                     "sequential within thread, timeout=%ds each",
                      len(prepared), timeout_s)
-            # Sequential, not parallel: a Tier-1 run can be a full `next build`
-            # (~1.5 GB RAM, CPU-bound). Running N of them at once overcommits
-            # the box (load 9, OOM). One at a time, each build gets the whole
-            # machine — faster per build and never thrashes.
-            for i, p in enumerate(prepared, 1):
-                short = _short_repo(p["repo_url"])
-                progress(f"Tier-1 tests ({i}/{len(prepared)}): {short}")
-                tr = _run_repo_tests(p["repo"], p["branch"], timeout_s)
-                test_results_by_repo[p["repo_url"]] = tr
-                log.info("test result %s: status=%s exit=%s dur=%ss",
-                         p["repo_url"], tr.get("status"), tr.get("exit_code"),
-                         tr.get("duration_s"))
 
-        progress("starting review")
+            def _run_tests_bg() -> dict:
+                results: dict = {}
+                for i, p in enumerate(prepared, 1):
+                    short = _short_repo(p["repo_url"])
+                    progress(f"Tier-1 tests ({i}/{len(prepared)}): {short}")
+                    tr = _run_repo_tests(p["repo"], p["branch"], timeout_s)
+                    results[p["repo_url"]] = tr
+                    log.info("test result %s: status=%s exit=%s dur=%ss",
+                             p["repo_url"], tr.get("status"), tr.get("exit_code"),
+                             tr.get("duration_s"))
+                # Stash on enclosing-scope dict too, so the outer code can
+                # read results for persistence even on the happy path.
+                test_results_by_repo.update(results)
+                return results
+
+            tests_future = TESTS_EXECUTOR.submit(_run_tests_bg)
+
+        progress("starting review (tests running in background)" if tests_future
+                 else "starting review")
         common = dict(
             only_globs=req.get("only", []),
             include_all=req.get("include_all", False),
@@ -542,9 +560,13 @@ def _run_job(job_id: str) -> None:
             no_handoff=req.get("no_handoff", False),
             context=req.get("context"),
             prior_result=prior_result,
-            test_results_by_repo=test_results_by_repo or None,
+            # When tests run in the background, ai_chat consumes them via
+            # tests_future and ignores test_results_by_repo. Pass None to
+            # make that intent explicit.
+            test_results_by_repo=None if tests_future else (test_results_by_repo or None),
             progress_cb=progress,
             feature=job_feature,   # enables .ai-collab/handoffs/<feature>.md discovery
+            tests_future=tests_future,
         )
 
         if len(prepared) == 1:
@@ -575,6 +597,18 @@ def _run_job(job_id: str) -> None:
                 error_trace=traceback.format_exc())
         _notify_job_done(job_id)
         log.exception("job %s failed", job_id)
+    finally:
+        # If tests were still running when the review failed, drain the
+        # future before returning. TESTS_EXECUTOR has a single worker that
+        # the next job will queue on — leaving a future in flight here would
+        # stall the next job at the test phase.
+        try:
+            if 'tests_future' in locals() and tests_future is not None \
+                    and not tests_future.done():
+                log.info("draining background tests after job %s exit", job_id)
+                tests_future.result(timeout=900)
+        except Exception:
+            log.exception("draining tests_future failed (continuing)")
 
 
 # --------------------------------------------------------------------------- #

@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 
 # Model-call resilience (issue #3): each claude/codex invocation is bounded
 # by a timeout and retried on transient failure.
@@ -654,8 +655,17 @@ def _run_review_pipeline(
     prior_result: dict | None = None,
     test_results_by_repo: dict | None = None,
     progress_cb=None,
+    tests_future: Future | None = None,
 ) -> dict:
-    """Two-phase review pipeline shared by the CLI and the HTTP server."""
+    """Two-phase review pipeline shared by the CLI and the HTTP server.
+
+    `tests_future`, if set, is awaited just before the reconcile phase. This
+    lets the server run tests in the background while the initial reviews are
+    already in flight — the reconcile phase still sees the results, but the
+    review phase no longer waits on tests. When set, `test_results_by_repo`
+    is ignored and reviewers don't see test results during the initial pass;
+    the reconcile prompt picks them up instead.
+    """
     cb = progress_cb if callable(progress_cb) else (lambda _m: None)
     context_block = f"# Context\n{extra_context}\n\n" if extra_context else ""
 
@@ -663,9 +673,15 @@ def _run_review_pipeline(
     if prior_block:
         prior_block = prior_block + "\n\n"
 
-    test_block = _build_test_section(test_results_by_repo)
-    if test_block:
-        test_block = test_block + "\n\n"
+    # Tests-in-parallel mode: defer the test block until reconcile so the
+    # initial reviews can start immediately without waiting for `next build`.
+    tests_deferred = tests_future is not None
+    if tests_deferred:
+        test_block = ""  # filled in before reconcile
+    else:
+        test_block = _build_test_section(test_results_by_repo)
+        if test_block:
+            test_block = test_block + "\n\n"
 
     initial_msg = (
         f"{context_block}"
@@ -714,24 +730,48 @@ def _run_review_pipeline(
         for k in ("input_tokens", "output_tokens", "usd"):
             usage_acc[who][k] += u.get(k, 0) or 0
 
-    info("phase 1/2 — independent reviews")
-    cb("phase 1/2 · Claude reviewing")
-    info("claude reviewing...")
-    claude_review, u = call_claude(roles["claude"], initial_msg)
-    _add("claude", u)
+    # Phase 1 — independent reviews. Claude and Codex are independent; run
+    # them concurrently. Each CLI call is bounded by MODEL_CALL_TIMEOUT_S so
+    # there's no risk of one wedging the other indefinitely.
+    info("phase 1/2 — independent reviews (Claude + Codex in parallel)")
+    cb("phase 1/2 · Claude+Codex reviewing in parallel")
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="review") as ex:
+        fut_c = ex.submit(call_claude, roles["claude"], initial_msg)
+        fut_x = ex.submit(call_codex, roles["codex"], initial_msg)
+        claude_review, u_c = fut_c.result()
+        codex_review, u_x = fut_x.result()
+    _add("claude", u_c)
+    _add("codex", u_x)
     claude_review, claude_block = _extract_findings_block(claude_review)
-    speak("claude", claude_review)
-    history.append({"speaker": "claude (initial)", "text": claude_review})
-
-    cb("phase 1/2 · Codex reviewing")
-    info("codex reviewing...")
-    codex_review, u = call_codex(roles["codex"], initial_msg)
-    _add("codex", u)
     codex_review, codex_block = _extract_findings_block(codex_review)
+    speak("claude", claude_review)
     speak("codex", codex_review)
+    history.append({"speaker": "claude (initial)", "text": claude_review})
     history.append({"speaker": "codex (initial)", "text": codex_review})
 
-    info("phase 2/2 — reconciling disagreements")
+    # If tests were deferred, await them now so the reconcile prompt can
+    # include them. We block here at the boundary between phase 1 and 2 —
+    # tests have had the entire review-phase wall time to make progress.
+    if tests_deferred:
+        cb("awaiting tests (tests ran in parallel with reviews)")
+        try:
+            test_results_by_repo = tests_future.result()
+        except Exception as e:
+            info(f"tests_future raised: {type(e).__name__}: {e}")
+            test_results_by_repo = None
+        test_block = _build_test_section(test_results_by_repo)
+        if test_block:
+            test_block = test_block + "\n\n"
+
+    info("phase 2/2 — reconciling disagreements (Claude + Codex in parallel)")
+    tests_in_reconcile_note = (
+        " The 'Test results' section above was not visible to the reviewers "
+        "during their initial pass (tests ran in parallel with reviews). If "
+        "any repo's tests failed and NEITHER reviewer flagged it, surface "
+        "that failure as a NEW finding in your reconciliation — failing "
+        "Tier-1 tests are a hard block regardless of how the diff looks."
+        if (tests_deferred and test_block) else ""
+    )
     reconcile_msg = (
         f"{context_block}"
         f"{prior_block}"
@@ -746,20 +786,20 @@ def _run_review_pipeline(
         f"partially right, or both wrong)? Be brief — one short paragraph per disagreement. "
         f"If both reviews fully agree, say so in one sentence and stop. Do not re-summarize "
         f"points both reviews already agree on."
+        + tests_in_reconcile_note
     )
 
-    cb("phase 2/2 · Claude reconciling")
-    info("claude reconciling...")
-    claude_reconcile, u = call_claude(roles["claude"], reconcile_msg)
-    _add("claude", u)
+    cb("phase 2/2 · Claude+Codex reconciling in parallel")
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="reconcile") as ex:
+        fut_c = ex.submit(call_claude, roles["claude"], reconcile_msg)
+        fut_x = ex.submit(call_codex, roles["codex"], reconcile_msg)
+        claude_reconcile, u_c = fut_c.result()
+        codex_reconcile, u_x = fut_x.result()
+    _add("claude", u_c)
+    _add("codex", u_x)
     speak("claude", claude_reconcile)
-    history.append({"speaker": "claude (reconcile)", "text": claude_reconcile})
-
-    cb("phase 2/2 · Codex reconciling")
-    info("codex reconciling...")
-    codex_reconcile, u = call_codex(roles["codex"], reconcile_msg)
-    _add("codex", u)
     speak("codex", codex_reconcile)
+    history.append({"speaker": "claude (reconcile)", "text": claude_reconcile})
     history.append({"speaker": "codex (reconcile)", "text": codex_reconcile})
     cb("finalizing")
 
@@ -840,6 +880,7 @@ def review_multi_repo_structured(
     test_results_by_repo: dict | None = None,
     progress_cb=None,
     feature: str | None = None,
+    tests_future: Future | None = None,
 ) -> dict:
     """Run a single review whose subject is changes across multiple repos.
 
@@ -918,7 +959,7 @@ def review_multi_repo_structured(
     result = _run_review_pipeline(
         roles, label, combined_payload, extra_context,
         prior_result=prior_result, test_results_by_repo=test_results_by_repo,
-        progress_cb=progress_cb,
+        progress_cb=progress_cb, tests_future=tests_future,
     )
     result["handoff_source"] = handoff_source
     result["request"] = {
@@ -947,6 +988,7 @@ def review_branch_structured(
     test_results_by_repo: dict | None = None,
     progress_cb=None,
     feature: str | None = None,
+    tests_future: Future | None = None,
 ) -> dict:
     """Server-friendly entrypoint. Runs a branch review and returns a structured result.
 
@@ -979,7 +1021,7 @@ def review_branch_structured(
     result = _run_review_pipeline(
         roles, label, payload, extra_context,
         prior_result=prior_result, test_results_by_repo=test_results_by_repo,
-        progress_cb=progress_cb,
+        progress_cb=progress_cb, tests_future=tests_future,
     )
     result["handoff_source"] = handoff_source
     result["request"] = {
