@@ -29,6 +29,8 @@ MODEL_CALL_BACKOFF_S = 10
 MAX_REVIEW_CHARS = 500_000
 
 # Path patterns that almost never carry signal in a feature-branch review.
+# The filter runs only when the caller didn't pass explicit `only` globs;
+# `only` is treated as an intentional override.
 NOISE_PATTERNS = [
     # Lockfiles
     "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "npm-shrinkwrap.json",
@@ -44,6 +46,16 @@ NOISE_PATTERNS = [
     "*.woff", "*.woff2", "*.ttf", "*.otf", "*.eot",
     "*.zip", "*.tar", "*.gz", "*.7z",
     "*.snap",  # jest snapshots
+    # EF Core auto-generated migration scaffolding. The hand-written
+    # migration `.cs` (Up/Down) is kept; only the mechanical companions
+    # — Designer file + the full model snapshot — are dropped.
+    "*.Designer.cs", "*ModelSnapshot.cs",
+    # Conventional generated-source markers (Roslyn / source generators,
+    # TS/JS codegen, OpenAPI clients, gRPC, etc.).
+    "*.generated.*", "*.g.cs", "*.g.ts", "*.g.js",
+    # Handoff is loaded by the server via path, not via the diff —
+    # stripping it from the diff doesn't hide it from reviewers.
+    ".ai-collab",
 ]
 
 ROOT = pathlib.Path(__file__).parent.resolve()
