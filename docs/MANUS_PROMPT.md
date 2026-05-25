@@ -177,6 +177,15 @@ You do not get to dismiss findings as "stylistic" or "out of scope." If your han
 
 You are running on Opus. Before you start fixing, classify each finding into one of three tiers so we route work efficiently — Opus stays focused on the fixes that actually need its judgment, Sonnet absorbs the mechanical ones, and anything that requires a decision I haven't already made comes back to me.
 
+**Each finding in `claude_findings` / `codex_findings` may include a `tier` field** (`"A"`, `"B"`, `"C"`, or absent/null) — the reviewer's suggestion for the fix-complexity tier. Use it as an *input*, not a verdict:
+
+- **Both reviewers proposed the same tier → default to that tier.** Two-model agreement on tier is as load-bearing as their agreement on the finding itself.
+- **Reviewers disagree on tier → take the more cautious side** (A vs B → B; B vs C → C). Disagreement is itself a hint the finding is judgment-bearing.
+- **One or both reviewers omitted the tier → apply your own classification** from the rubric below.
+- **Your structural rules always override a reviewer-proposed A.** If both reviewers said `blocking`, OR the finding touches concurrency / cross-repo contracts / auth / migration with backfill, promote to Tier B regardless of what the reviewers suggested. Reviewers can suggest *up*, not *down*.
+
+The reviewers were told to default to suggesting up when uncertain, so under-tiering from their side should be rare. Treat a reviewer-proposed C as a hard requirement to surface to me before fixing.
+
 **Tier A — Sonnet-OK (delegate down):**
 - Mechanical, locally-scoped, one obvious correct answer.
 - Examples: rename, missing null/empty-check on an obvious nullable, typo, missing index or FK on an obvious column, pageSize / clamp / bounds, trim whitespace, `GroupBy.Count` → `COUNT(DISTINCT)`, accessibility attrs, dedupe a helper into a shared module, hard-coded English in a localized component.

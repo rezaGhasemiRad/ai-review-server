@@ -796,11 +796,37 @@ def _run_review_pipeline(
         '{"verdict": "approve|request-changes|blocking", "findings": ['
         '{"severity": "bug|concern|nit", "repo": "<repo name or null>", '
         '"file": "<path or null>", "lines": "<range or null>", '
-        '"title": "<one-line summary>", "detail": "<short explanation>"}]}\n'
+        '"title": "<one-line summary>", "detail": "<short explanation>", '
+        '"tier": "A|B|C|null"}]}\n'
         "The findings array must mirror the issues in your markdown review — one entry "
         "per concrete issue. If you found nothing in a category, simply omit it. The "
         "markdown review above the block stays the human-readable version; the JSON is "
-        "the machine copy."
+        "the machine copy.\n\n"
+        "## On the `tier` field — fix-complexity routing\n"
+        "The implementer runs on a strong model by default; some findings can be "
+        "delegated to a cheaper model, some can't, some need a human decision. Suggest "
+        "a tier per finding so the implementer's router has a hint. Tier is not about "
+        "your confidence in the finding — only about the *fix* it will require:\n"
+        "- **A** (Sonnet-OK): mechanical, locally-scoped, one obvious correct answer. "
+        "Rename, missing null check on an obvious nullable, typo, missing index/FK on "
+        "an obvious column, pageSize clamp, hard-coded i18n string, dedupe a helper. "
+        "If a cheap model got this wrong, the next review pass would catch it cheaply.\n"
+        "- **B** (needs the strong model): high-judgment, cross-cutting, or design-"
+        "bearing. Concurrency / race fixes, isolation-level decisions, cross-repo "
+        "contract changes that must move in lockstep, auth / permission model changes, "
+        "migration design with backfill or production-data invariants, architectural "
+        "refactors. A cheap-model attempt could land syntactically clean but "
+        "semantically wrong in a way the next review wouldn't catch.\n"
+        "- **C** (ask the human): the finding requires a *decision*, not a *fix*. The "
+        "right scope is unclear, the finding contradicts an explicit design decision in "
+        "the handoff, or it's a cost/benefit call the implementer can't make alone.\n"
+        "- **null**: you're unsure. Omit the field or set it to null — the implementer "
+        "will classify it from its own rubric.\n"
+        "Default to suggesting *up*, not *down*: when in doubt between A and B, "
+        "say B. The implementer's structural rules (anything both reviewers tag "
+        "`blocking`, anything touching concurrency or cross-repo contracts) will "
+        "override a reviewer-suggested A regardless, so under-tiering costs more "
+        "than over-tiering."
     )
 
     history: list[dict] = [{"speaker": "system", "text": f"Subject: {label}\n\n{payload}"}]
