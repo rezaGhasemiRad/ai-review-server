@@ -364,6 +364,86 @@ def _filter_diff(
     return body, stats
 
 
+def _trim_payload_to_files(payload: str, kept_files: set[str]) -> tuple[str, dict]:
+    """For the reconcile phase, replace each ```diff …``` block in the
+    payload with just the file chunks whose paths are in `kept_files`.
+
+    The reconciler is told to focus on disagreements; the initial reviews
+    already cite line numbers, so the full diff is mostly dead weight at
+    that point. We keep only the files the two reviewers actually pointed
+    at — the reconciler can still fact-check those citations against the
+    real diff.
+
+    Returns (trimmed_payload, stats). Stats let the caller decide whether
+    the trim was worth applying.
+    """
+    if not kept_files:
+        return payload, {"applied": False, "reason": "no kept files"}
+
+    total_files = 0
+    kept_count = 0
+    chars_before = 0
+    chars_after = 0
+
+    def _trim_block(m: re.Match) -> str:
+        nonlocal total_files, kept_count, chars_before, chars_after
+        body = m.group(1)
+        chars_before += len(body)
+        chunks = _split_diff_by_file(body)
+        total_files += len(chunks)
+        kept = [(p, c) for p, c in chunks if p in kept_files]
+        kept_count += len(kept)
+        if not kept:
+            # No mentioned files in this block; drop it entirely with a
+            # one-line note so the reconciler knows the diff was intentional
+            # rather than missing.
+            note = (
+                "```diff\n"
+                "(this diff section was elided — neither reviewer cited "
+                "any file in it. Their reviews cover all flagged content.)\n"
+                "```"
+            )
+            chars_after += len(note) - len("```diff\n\n```")
+            return note
+        new_body = "".join(c for _, c in kept)
+        chars_after += len(new_body)
+        return f"```diff\n{new_body}```"
+
+    trimmed = re.sub(r"```diff\n(.*?)```", _trim_block, payload, flags=re.DOTALL)
+    return trimmed, {
+        "applied": True,
+        "total_files": total_files,
+        "kept_files": kept_count,
+        "chars_before": chars_before,
+        "chars_after": chars_after,
+    }
+
+
+def _findings_files(findings: list) -> set[str]:
+    """Collect non-empty `file` paths from a structured findings list."""
+    out: set[str] = set()
+    for f in findings or []:
+        if not isinstance(f, dict):
+            continue
+        path = f.get("file")
+        if isinstance(path, str) and path.strip():
+            out.add(path.strip())
+    return out
+
+
+def _findings_from_block(block: dict | None) -> list:
+    if isinstance(block, dict) and isinstance(block.get("findings"), list):
+        return block["findings"]
+    return []
+
+
+def _verdict_from_block_or_text(block: dict | None, review_md: str) -> str | None:
+    if isinstance(block, dict) and block.get("verdict"):
+        return str(block["verdict"]).lower()
+    m = re.search(r"\*{0,2}Verdict:?\*{0,2}\s*`?([A-Za-z\-]+)`?", review_md)
+    return m.group(1).lower() if m else None
+
+
 def load_code_input(
     file_path: str | None,
     diff_ref: str | None,
@@ -763,62 +843,120 @@ def _run_review_pipeline(
         if test_block:
             test_block = test_block + "\n\n"
 
-    info("phase 2/2 — reconciling disagreements (Claude + Codex in parallel)")
-    tests_in_reconcile_note = (
-        " The 'Test results' section above was not visible to the reviewers "
-        "during their initial pass (tests ran in parallel with reviews). If "
-        "any repo's tests failed and NEITHER reviewer flagged it, surface "
-        "that failure as a NEW finding in your reconciliation — failing "
-        "Tier-1 tests are a hard block regardless of how the diff looks."
-        if (tests_deferred and test_block) else ""
+    # --- Skip reconcile when there's nothing to reconcile ----------------
+    # If both reviewers approved with zero findings AND no failing tests,
+    # there are no disagreements to resolve. Reconcile is pure overhead in
+    # that case — drop the two model calls and synthesize a trivial summary.
+    claude_verdict_p1 = _verdict_from_block_or_text(claude_block, claude_review)
+    codex_verdict_p1 = _verdict_from_block_or_text(codex_block, codex_review)
+    claude_findings_p1 = _findings_from_block(claude_block)
+    codex_findings_p1 = _findings_from_block(codex_block)
+    test_failures = any(
+        (tr or {}).get("status") not in ("passed", "skipped", None)
+        for tr in (test_results_by_repo or {}).values()
     )
-    reconcile_msg = (
-        f"{context_block}"
-        f"{prior_block}"
-        f"{test_block}"
-        f"# Code under review ({label})\n\n{payload}\n\n"
-        f"# Reviewer A — Claude's review\n{claude_review}\n\n"
-        f"# Reviewer B — Codex's review\n{codex_review}\n\n"
-        f"# Your task\n"
-        f"You have just seen both independent reviews above. Focus ONLY on points where the "
-        f"two reviews disagree, or where one reviewer caught something the other missed. "
-        f"For each such point, take a clear position: which reviewer is right (or are both "
-        f"partially right, or both wrong)? Be brief — one short paragraph per disagreement. "
-        f"If both reviews fully agree, say so in one sentence and stop. Do not re-summarize "
-        f"points both reviews already agree on."
-        + tests_in_reconcile_note
+    both_clean = (
+        claude_verdict_p1 == "approve"
+        and codex_verdict_p1 == "approve"
+        and not claude_findings_p1
+        and not codex_findings_p1
+        and not test_failures
     )
+    if both_clean:
+        info("phase 2/2 — skipped (both reviewers approved with no findings, "
+             "no test failures)")
+        cb("phase 2/2 · skipped (clean review)")
+        skip_note = (
+            "Reconcile skipped — both reviewers returned `approve` with no "
+            "findings, and Tier-1 tests passed in every repo. There were no "
+            "disagreements or unflagged blockers to resolve."
+        )
+        claude_reconcile = skip_note
+        codex_reconcile = skip_note
+        history.append({"speaker": "claude (reconcile)", "text": claude_reconcile})
+        history.append({"speaker": "codex (reconcile)", "text": codex_reconcile})
+        cb("finalizing")
+    else:
+        # --- Surgical reconcile payload --------------------------------------
+        # Trim the diff to only files that either reviewer's findings cite.
+        # The reconciler can still fact-check contested citations against the
+        # real diff, but doesn't re-pay for the whole branch context.
+        # Safety net: if any finding lacks a specific file (general concerns
+        # like "no test coverage"), fall back to the full diff so the
+        # reconciler keeps full context for that general claim.
+        cited_files = _findings_files(claude_findings_p1) | _findings_files(codex_findings_p1)
+        any_general = any(
+            (not isinstance(f, dict)) or not (isinstance(f.get("file"), str) and f["file"].strip())
+            for f in (claude_findings_p1 + codex_findings_p1)
+        )
+        if cited_files and not any_general:
+            trimmed_payload, trim_stats = _trim_payload_to_files(payload, cited_files)
+            if trim_stats.get("applied") and trim_stats.get("chars_after", 0) < trim_stats.get("chars_before", 0):
+                info(
+                    f"reconcile diff trimmed: {trim_stats['kept_files']}/{trim_stats['total_files']} "
+                    f"files kept, {trim_stats['chars_before']:,} → {trim_stats['chars_after']:,} chars"
+                )
+                reconcile_payload = trimmed_payload
+                trim_note = (
+                    " The diff below has been trimmed to only the files cited by either "
+                    "reviewer's findings — the reconciler's job is to verify those "
+                    "citations and resolve disagreements, not re-scan the whole branch. "
+                    "If you need to verify a citation against a file that's elided, say "
+                    "so in your output rather than guessing."
+                )
+            else:
+                reconcile_payload = payload
+                trim_note = ""
+        else:
+            reconcile_payload = payload
+            trim_note = ""
 
-    cb("phase 2/2 · Claude+Codex reconciling in parallel")
-    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="reconcile") as ex:
-        fut_c = ex.submit(call_claude, roles["claude"], reconcile_msg)
-        fut_x = ex.submit(call_codex, roles["codex"], reconcile_msg)
-        claude_reconcile, u_c = fut_c.result()
-        codex_reconcile, u_x = fut_x.result()
-    _add("claude", u_c)
-    _add("codex", u_x)
-    speak("claude", claude_reconcile)
-    speak("codex", codex_reconcile)
-    history.append({"speaker": "claude (reconcile)", "text": claude_reconcile})
-    history.append({"speaker": "codex (reconcile)", "text": codex_reconcile})
-    cb("finalizing")
+        info("phase 2/2 — reconciling disagreements (Claude + Codex in parallel)")
+        tests_in_reconcile_note = (
+            " The 'Test results' section above was not visible to the reviewers "
+            "during their initial pass (tests ran in parallel with reviews). If "
+            "any repo's tests failed and NEITHER reviewer flagged it, surface "
+            "that failure as a NEW finding in your reconciliation — failing "
+            "Tier-1 tests are a hard block regardless of how the diff looks."
+            if (tests_deferred and test_block) else ""
+        )
+        reconcile_msg = (
+            f"{context_block}"
+            f"{prior_block}"
+            f"{test_block}"
+            f"# Code under review ({label})\n\n{reconcile_payload}\n\n"
+            f"# Reviewer A — Claude's review\n{claude_review}\n\n"
+            f"# Reviewer B — Codex's review\n{codex_review}\n\n"
+            f"# Your task\n"
+            f"You have just seen both independent reviews above. Focus ONLY on points where the "
+            f"two reviews disagree, or where one reviewer caught something the other missed. "
+            f"For each such point, take a clear position: which reviewer is right (or are both "
+            f"partially right, or both wrong)? Be brief — one short paragraph per disagreement. "
+            f"If both reviews fully agree, say so in one sentence and stop. Do not re-summarize "
+            f"points both reviews already agree on."
+            + trim_note
+            + tests_in_reconcile_note
+        )
+
+        cb("phase 2/2 · Claude+Codex reconciling in parallel")
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="reconcile") as ex:
+            fut_c = ex.submit(call_claude, roles["claude"], reconcile_msg)
+            fut_x = ex.submit(call_codex, roles["codex"], reconcile_msg)
+            claude_reconcile, u_c = fut_c.result()
+            codex_reconcile, u_x = fut_x.result()
+        _add("claude", u_c)
+        _add("codex", u_x)
+        speak("claude", claude_reconcile)
+        speak("codex", codex_reconcile)
+        history.append({"speaker": "claude (reconcile)", "text": claude_reconcile})
+        history.append({"speaker": "codex (reconcile)", "text": codex_reconcile})
+        cb("finalizing")
 
     transcript_path = save_transcript("review", label, history)
     transcript_md = transcript_path.read_text(encoding="utf-8")
 
-    def _findings(block: dict | None) -> list:
-        if isinstance(block, dict) and isinstance(block.get("findings"), list):
-            return block["findings"]
-        return []
-
-    def _verdict(block: dict | None, review_md: str) -> str | None:
-        if isinstance(block, dict) and block.get("verdict"):
-            return str(block["verdict"]).lower()
-        m = re.search(r"\*{0,2}Verdict:?\*{0,2}\s*`?([A-Za-z\-]+)`?", review_md)
-        return m.group(1).lower() if m else None
-
-    claude_findings = _findings(claude_block)
-    codex_findings = _findings(codex_block)
+    claude_findings = _findings_from_block(claude_block)
+    codex_findings = _findings_from_block(codex_block)
     usage = {
         "claude": usage_acc["claude"],
         "codex": usage_acc["codex"],
@@ -840,8 +978,8 @@ def _run_review_pipeline(
         "codex_reconcile": codex_reconcile,
         "claude_findings": claude_findings,
         "codex_findings": codex_findings,
-        "claude_verdict": _verdict(claude_block, claude_review),
-        "codex_verdict": _verdict(codex_block, codex_review),
+        "claude_verdict": _verdict_from_block_or_text(claude_block, claude_review),
+        "codex_verdict": _verdict_from_block_or_text(codex_block, codex_review),
         "usage": usage,
         "transcript_path": str(transcript_path),
         "transcript_md": transcript_md,
