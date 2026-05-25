@@ -173,6 +173,53 @@ Poll no faster than every 30 s. Reviews take 3–15 minutes (tests run first, se
 
 You do not get to dismiss findings as "stylistic" or "out of scope." If your handoff was clear and the finding still landed, it stands. The reviewers were told to treat your handoff as a claim to verify, not ground truth.
 
+## 6b. Classify each finding by fix-complexity tier
+
+You are running on Opus. Before you start fixing, classify each finding into one of three tiers so we route work efficiently — Opus stays focused on the fixes that actually need its judgment, Sonnet absorbs the mechanical ones, and anything that requires a decision I haven't already made comes back to me.
+
+**Tier A — Sonnet-OK (delegate down):**
+- Mechanical, locally-scoped, one obvious correct answer.
+- Examples: rename, missing null/empty-check on an obvious nullable, typo, missing index or FK on an obvious column, pageSize / clamp / bounds, trim whitespace, `GroupBy.Count` → `COUNT(DISTINCT)`, accessibility attrs, dedupe a helper into a shared module, hard-coded English in a localized component.
+- Test: *if I got this wrong, the next review pass would catch it cheaply and the blast radius is small.*
+
+**Tier B — keep on Opus (you fix):**
+- High-judgment, cross-cutting, or design-bearing. Worth Opus's attention because a Sonnet attempt might land syntactically clean but semantically wrong in a way the next review wouldn't catch.
+- Examples: concurrency / race fixes (isolation levels, transaction boundaries, `SELECT FOR UPDATE`, optimistic locking), cross-repo contract changes that must move in lockstep, auth / permission model changes, migration design with backfill or production-data invariants, refactors that touch architectural patterns.
+- **Both reviewers disagreed on it in `*_reconcile`** — that's the strongest Tier B signal. Two-model disagreement is exactly where high-judgment matters.
+- **Both reviewers tagged it `blocking`** — default to Tier B regardless of how mechanical it looks.
+- Test: *if I got this wrong, it could ship and bite in production before the next review pass would notice.*
+
+**Tier C — ask me (don't fix, don't delegate):**
+- The finding requires a decision I haven't made, not a fix I haven't written.
+- Examples: the finding contradicts an explicit design decision in the handoff (something has to give — me, the reviewer, or the spec); the reviewer flagged a real issue but its scope is genuinely outside this feature (we may want to defer, not silently fix); a cost/benefit call ("add a safety net here or accept the limitation?"); a reviewer raised a finding both Sonnet and Opus would handle correctly *mechanically* but where the right product behaviour isn't actually settled.
+- Test: *the question isn't "how do I fix this" — it's "should this be fixed at all, here, now."*
+
+Apply the heuristic per finding, not per file. One finding can be Tier A while another in the same file is Tier B.
+
+**Report your classification before fixing anything:**
+
+```
+Tier A — delegate to Sonnet:
+  - [severity][repo:file] <title>
+  - ...
+
+Tier B — I (Opus) will fix:
+  - [severity][repo:file] <title>
+    Reason: <one line — why this is judgment-bearing, not mechanical>
+  - ...
+
+Tier C — need your decision:
+  - [severity][repo:file] <title>
+    Question: <one-sentence, decision-shaped — not "how" but "should we / which way / is this in scope">
+  - ...
+
+Ambiguous (your call):
+  - [severity][repo:file] <title>
+    Reason: <one line — what's unclear about which tier>
+```
+
+Wait for me to resolve Tier C and any Ambiguous items before resubmitting. If there are none, you can proceed straight to step 7. When dispatching Tier A, give the Sonnet worker the finding's `title`, `detail`, and `file` verbatim — don't paraphrase.
+
 ## 7. Iterate
 
 If there are blocking findings:
