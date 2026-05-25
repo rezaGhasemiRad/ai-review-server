@@ -149,11 +149,26 @@ Poll no faster than every 30 s. Reviews take 3–15 minutes (tests run first, se
 
 ## 6. Read the result and decide
 
+**Cost discipline for AI consumers.** Save the response to disk and parse out only the fields you'll act on — never `cat result.json` or echo the raw body into your conversation. Every byte that enters your context gets re-served on every subsequent turn, so a 100 KB response read into chat 30 times bills as 3 MB. Use `jq` to extract specific fields:
+
+```bash
+curl -sS -H "Authorization: Bearer $REVIEW_SERVER_API_KEY" "$STATUS_URL" > /tmp/result.json
+
+# Extract only what you need into shell variables / smaller files:
+jq -r '.status'                              < /tmp/result.json
+jq '.result.claude_verdict, .result.codex_verdict' < /tmp/result.json
+jq '.result.claude_findings'                 < /tmp/result.json > /tmp/claude_findings.json
+jq '.result.codex_findings'                  < /tmp/result.json > /tmp/codex_findings.json
+jq '.result.test_results'                    < /tmp/result.json
+```
+
+`GET /reviews/{job_id}` returns a **lean payload by default**: structured findings, verdicts, reconcile notes, usage, per-repo test status with a compressed `stdout_tail` (just the runner's pass/fail summary on success, noise-stripped tail on failure). The full reviewer transcript is **not** included — it lives at `GET /reviews/{job_id}/transcript` (plain markdown) and you almost never need it. Pass `?full=true` only if you genuinely need the unabridged payload (raw stdout, full transcript).
+
 `status == "error"` → surface the `error` field and stop. Do not retry the same submission.
 
 `status == "complete"` → the `result` object contains:
 - `claude_review`, `codex_review`, `claude_reconcile`, `codex_reconcile` — markdown
-- `claude_findings`, `codex_findings` — **structured** arrays of `{severity, repo, file, lines, title, detail}` where `severity` is `bug` / `concern` / `nit`
+- `claude_findings`, `codex_findings` — **structured** arrays of `{severity, repo, file, lines, title, detail, tier}` where `severity` is `bug` / `concern` / `nit` and `tier` is the reviewer's suggested fix-complexity routing (see step 6b)
 - `claude_verdict`, `codex_verdict` — `approve` / `request-changes` / `blocking`
 - `test_results` — per-repo Tier-1 outcome
 - `usage` — token + cost

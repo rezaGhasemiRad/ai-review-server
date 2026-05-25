@@ -36,7 +36,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field, field_validator
 
 import urllib.parse
@@ -779,8 +779,120 @@ def submit_review(req: ReviewRequest, request: Request) -> JobSubmitted:
     )
 
 
+# --------------------------------------------------------------------------- #
+# Lean payload — keep AI consumers from re-billing the full response on every
+# turn of their conversation. The heavy fields (full reviewer transcript and
+# raw test output) move behind explicit opt-in via ?full=true or the dedicated
+# /transcript route. Default GET /reviews/{id} returns a payload focused on
+# what a consumer *acts on*: verdicts, structured findings, reconcile notes,
+# usage, and a per-repo test summary.
+# --------------------------------------------------------------------------- #
+
+# Known test-summary lines, ordered by specificity. We search backwards through
+# stdout for the FIRST match — that's the runner's final summary in almost all
+# real outputs. Tuned for the runners this server actually sees today.
+_TEST_SUMMARY_PATTERNS = [
+    # .NET — `dotnet test` end-of-run line
+    re.compile(r"^(Passed!.*$)", re.MULTILINE),
+    re.compile(r"^(Failed!.*$)", re.MULTILINE),
+    re.compile(r"^(Test Run Successful\.?)\s*$", re.MULTILINE),
+    re.compile(r"^(Test Run Failed\.?)\s*$", re.MULTILINE),
+    # Jest / Vitest — multi-line summary block; we anchor on "Tests:"
+    re.compile(r"^(Tests?:\s+.*$)", re.MULTILINE),
+    # pytest — boxed summary "===== N passed in X.Xs ====="
+    re.compile(r"^(=+\s*\d+\s+passed.*=+)\s*$", re.MULTILINE),
+    re.compile(r"^(=+\s*\d+\s+failed.*=+)\s*$", re.MULTILINE),
+    # npm test fallback — the post-test summary
+    re.compile(r"^(Test Suites:.*$)", re.MULTILINE),
+]
+
+# .NET MSB3277 dependency-conflict warnings repeat per project reference and
+# carry no actionable signal. Filter them from the failed-tail before showing.
+_NOISE_LINE_PATTERNS = [
+    re.compile(r"^.*: warning MSB3277:.*$", re.MULTILINE),
+    re.compile(r"^.*: warning MSB3243:.*$", re.MULTILINE),  # version mismatch sibling
+    re.compile(r"^.*: warning NU\d+:.*$", re.MULTILINE),    # NuGet warnings
+]
+
+
+def _lean_test_output(stdout_tail: str, status: str) -> str:
+    """Compress a raw stdout tail into the smallest version a consumer can
+    still act on.
+
+    - passed → just the runner's summary line (often a single line, ~100 bytes)
+    - failed/timeout → tail with known-noise lines stripped, capped at 3 KB
+    - other (skipped/error) → unchanged (already small)
+    """
+    if not stdout_tail:
+        return stdout_tail
+    if status == "passed":
+        for pat in _TEST_SUMMARY_PATTERNS:
+            m = pat.search(stdout_tail)
+            if m:
+                return m.group(1).rstrip()
+        # No known summary pattern — keep the last few non-empty lines so the
+        # consumer at least sees the runner finished cleanly.
+        lines = [ln for ln in stdout_tail.splitlines() if ln.strip()]
+        return "\n".join(lines[-5:])
+    if status in ("failed", "timeout"):
+        filtered = stdout_tail
+        for pat in _NOISE_LINE_PATTERNS:
+            filtered = pat.sub("", filtered)
+        # Collapse runs of blank lines created by the noise removal.
+        filtered = re.sub(r"\n{3,}", "\n\n", filtered)
+        # Cap at 3 KB tail — failure context lives at the bottom.
+        if len(filtered) > 3000:
+            filtered = "... (older output trimmed) ...\n" + filtered[-3000:]
+        return filtered.rstrip()
+    return stdout_tail
+
+
+def _lean_result(result: dict, job_id: str) -> dict:
+    """Strip / compress heavy fields for the default GET response.
+
+    Removes:
+      - transcript_md (full reviewer transcript — usually the largest field)
+      - per-repo stderr_tail (failure context lives in stdout_tail; stderr
+        is almost always shell warnings on success and a dup of stdout on
+        failure)
+
+    Compresses:
+      - test_results[*].stdout_tail → runner summary line on passed runs,
+        noise-stripped tail on failed runs (see _lean_test_output)
+
+    Adds:
+      - transcript_url pointing to the dedicated transcript route
+    """
+    out = dict(result)  # shallow copy — we'll only replace specific keys
+    if "transcript_md" in out:
+        del out["transcript_md"]
+    out["transcript_url"] = f"/reviews/{job_id}/transcript"
+
+    tr_by_repo = out.get("test_results")
+    if isinstance(tr_by_repo, dict):
+        compressed: dict[str, dict] = {}
+        for repo, tr in tr_by_repo.items():
+            if not isinstance(tr, dict):
+                compressed[repo] = tr
+                continue
+            tr2 = dict(tr)
+            status = tr2.get("status") or ""
+            if "stdout_tail" in tr2:
+                tr2["stdout_tail"] = _lean_test_output(tr2["stdout_tail"], status)
+            tr2.pop("stderr_tail", None)
+            compressed[repo] = tr2
+        out["test_results"] = compressed
+
+    return out
+
+
 @app.get("/reviews/{job_id}", dependencies=[Depends(require_bearer)])
-def get_review(job_id: str):
+def get_review(job_id: str, full: bool = False):
+    """Return a job record. Defaults to a lean shape (heavy fields stripped /
+    compressed) to keep AI consumers from re-billing the same bytes on every
+    turn of their conversation. Pass `?full=true` to get the raw record —
+    used by the dashboard and by humans debugging the reviewer itself.
+    """
     with JOBS_LOCK:
         job = JOBS.get(job_id)
     if job is None:
@@ -789,7 +901,34 @@ def get_review(job_id: str):
         raise HTTPException(status_code=404, detail="job not found")
     # Strip in-memory-only keys (e.g. _future from /cancel) — they aren't
     # JSON-serializable and FastAPI would 500 otherwise.
-    return {k: v for k, v in job.items() if not k.startswith("_")}
+    cleaned = {k: v for k, v in job.items() if not k.startswith("_")}
+    if full:
+        return cleaned
+    result = cleaned.get("result")
+    if isinstance(result, dict):
+        cleaned["result"] = _lean_result(result, job_id)
+    return cleaned
+
+
+@app.get("/reviews/{job_id}/transcript", dependencies=[Depends(require_bearer)])
+def get_review_transcript(job_id: str):
+    """Return the full reviewer transcript as plain markdown. Pulled out of
+    the default review response because it's the largest field and most
+    consumers don't act on it — they read findings, not transcripts.
+    """
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+    if job is None:
+        job = _load_from_disk(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="job not found")
+    transcript = ((job.get("result") or {}).get("transcript_md")) or ""
+    if not transcript:
+        # Either still running, errored before any review work, or older
+        # job that predates transcript capture. 404 keeps the contract
+        # honest: there is nothing here.
+        raise HTTPException(status_code=404, detail="no transcript available")
+    return PlainTextResponse(transcript, media_type="text/markdown; charset=utf-8")
 
 
 def _iter_jobs():

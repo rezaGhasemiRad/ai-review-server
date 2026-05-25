@@ -357,7 +357,10 @@ window.addEventListener('hashchange', applyRoute);
 async function loadDetail(){
   let j;
   try {
-    j = await api('/reviews/'+openJobId);
+    // ?full=true — the dashboard renders transcript + raw test output
+    // inline, so it wants the unabridged payload. AI consumers get the
+    // lean default; this is the explicit opt-in for human display.
+    j = await api('/reviews/'+openJobId+'?full=true');
   } catch(e) {
     // Server-side serialization can fail for running jobs that have an
     // unserializable Future attached (known bug). Show something useful
