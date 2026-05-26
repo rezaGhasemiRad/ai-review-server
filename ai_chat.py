@@ -317,49 +317,102 @@ def _split_diff_by_file(diff: str) -> list[tuple[str, str]]:
     return chunks
 
 
-def _is_noise(path: str) -> bool:
+def _matches_glob_list(path: str, globs: list[str]) -> bool:
+    """fnmatch a path against a list of globs. A bare token (no slash, no
+    dot, no wildcard) is treated as a directory-component match — so the
+    pattern `node_modules` excludes anything under any `node_modules/` dir,
+    not just a file literally named `node_modules`."""
+    if not globs:
+        return False
     name = pathlib.Path(path).name
     parts = path.replace("\\", "/").split("/")
-    for pat in NOISE_PATTERNS:
-        # Directory-component match (no wildcard, no extension)
+    for pat in globs:
         if "/" not in pat and "." not in pat and "*" not in pat:
             if pat in parts:
                 return True
             continue
-        # Glob match against full path or basename
         if fnmatch.fnmatch(path, pat) or fnmatch.fnmatch(name, pat):
             return True
     return False
 
 
+def _is_noise(path: str) -> bool:
+    return _matches_glob_list(path, NOISE_PATTERNS)
+
+
+def _read_exclude_globs(repo: str | None, branch: str | None) -> list[str]:
+    """Read per-repo `.ai-collab/review-exclude.txt` at the given branch.
+    Returns a list of non-blank, non-comment glob lines. Missing file,
+    binary file, or any git error yields []. Reading via `git show` makes
+    the exclusion list move with the feature branch — the coder AI commits
+    its noise globs alongside the code, no out-of-band server config."""
+    if not repo or not branch:
+        return []
+    r = _git(repo, "show", f"{branch}:.ai-collab/review-exclude.txt")
+    if r.returncode != 0:
+        return []  # file not present on this branch — normal case
+    out: list[str] = []
+    for line in r.stdout.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        out.append(s)
+    return out
+
+
 def _filter_diff(
-    diff: str, only_globs: list[str], include_all: bool
+    diff: str,
+    only_globs: list[str],
+    include_all: bool,
+    extra_exclude_globs: list[str] | None = None,
 ) -> tuple[str, dict]:
+    """Filter a unified diff to the files that should be reviewed.
+
+    `extra_exclude_globs` is the per-repo `.ai-collab/review-exclude.txt`
+    list. It only applies in the default-noise-filtering mode (when neither
+    `only_globs` nor `include_all` is set). The noise check runs first, so
+    `repo_excluded_*` counts only files that would have been kept otherwise
+    — that gives the UI a meaningful "extra files filtered by this repo's
+    own list" number, separate from the baseline noise count.
+    """
+    extra_exclude_globs = extra_exclude_globs or []
     chunks = _split_diff_by_file(diff)
     kept: list[tuple[str, str]] = []
     skipped: list[tuple[str, int]] = []
+    repo_excluded: list[tuple[str, int]] = []
     for path, chunk in chunks:
         if only_globs:
             keep = any(
                 fnmatch.fnmatch(path, g) or fnmatch.fnmatch(pathlib.Path(path).name, g)
                 for g in only_globs
             )
-        elif include_all:
-            keep = True
-        else:
-            keep = not _is_noise(path)
-        if keep:
+            (kept if keep else skipped).append(
+                (path, chunk) if keep else (path, len(chunk))
+            )
+            continue
+        if include_all:
             kept.append((path, chunk))
-        else:
+            continue
+        # Default mode: noise filter first, then per-repo extras.
+        if _is_noise(path):
             skipped.append((path, len(chunk)))
+        elif _matches_glob_list(path, extra_exclude_globs):
+            repo_excluded.append((path, len(chunk)))
+        else:
+            kept.append((path, chunk))
     body = "".join(c for _, c in kept)
     stats = {
         "total_files": len(chunks),
         "kept_files": len(kept),
-        "skipped_files": len(skipped),
-        "skipped_chars": sum(b for _, b in skipped),
+        # Backward-compatible totals — callers reading skipped_files expect
+        # "everything that didn't make it in", regardless of reason.
+        "skipped_files": len(skipped) + len(repo_excluded),
+        "skipped_chars": sum(b for _, b in skipped) + sum(b for _, b in repo_excluded),
         "kept_paths": [p for p, _ in kept],
-        "skipped_paths": [p for p, _ in skipped],
+        "skipped_paths": [p for p, _ in skipped] + [p for p, _ in repo_excluded],
+        # New: just the per-repo extras, for UI display and operator visibility.
+        "repo_excluded_files": len(repo_excluded),
+        "repo_excluded_paths": [p for p, _ in repo_excluded],
     }
     return body, stats
 
@@ -585,7 +638,18 @@ def load_code_input(
             sys.exit(f"No changes between {base} and {branch} — nothing to review.")
 
         raw_chars = len(diff.stdout)
-        filtered, fstats = _filter_diff(diff.stdout, only_globs or [], include_all)
+        # Per-repo additive exclusion list — committed by the coder AI to
+        # the feature branch at .ai-collab/review-exclude.txt. Only applies
+        # in default-filter mode; `only`/`include_all` are explicit overrides
+        # that bypass it.
+        repo_excludes = (
+            _read_exclude_globs(repo, branch)
+            if not only_globs and not include_all
+            else []
+        )
+        filtered, fstats = _filter_diff(
+            diff.stdout, only_globs or [], include_all, repo_excludes
+        )
         if fstats["skipped_files"]:
             info(
                 f"filtered {fstats['skipped_files']}/{fstats['total_files']} files "
@@ -596,6 +660,17 @@ def load_code_input(
                 preview = ", ".join(fstats["skipped_paths"][:5])
                 extra = "" if fstats["skipped_files"] <= 5 else f", +{fstats['skipped_files'] - 5} more"
                 info(f"skipped (noise): {preview}{extra}")
+        if fstats.get("repo_excluded_files"):
+            preview = ", ".join(fstats["repo_excluded_paths"][:5])
+            extra = (
+                ""
+                if fstats["repo_excluded_files"] <= 5
+                else f", +{fstats['repo_excluded_files'] - 5} more"
+            )
+            info(
+                f"excluded by .ai-collab/review-exclude.txt "
+                f"({len(repo_excludes)} globs): {preview}{extra}"
+            )
 
         if len(filtered) > MAX_REVIEW_CHARS:
             kept_preview = "\n  ".join(fstats["kept_paths"][:30])
