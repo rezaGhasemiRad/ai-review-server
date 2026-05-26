@@ -87,6 +87,13 @@
   .sev-bug{background:#fee2e2;color:#b91c1c;}
   .sev-concern{background:#fef3c7;color:#b45309;}
   .sev-nit{background:#f1f3f5;color:#6b7280;}
+  /* Fix-complexity tier suggested by reviewers; routes the dev AI's
+     model choice. A=Sonnet-OK, B=needs Opus, C=ask human. */
+  .tier { font-size:11px; font-weight:700; padding:1px 6px; border-radius:4px;
+          margin-left:4px; cursor:help; }
+  .tier-A{background:#cffafe;color:#0e7490;}
+  .tier-B{background:#ede9fe;color:#6d28d9;}
+  .tier-C{background:#fce7f3;color:#be185d;}
   .fgrid { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
   @media(max-width:720px){ .fgrid{grid-template-columns:1fr;} }
   .iter { display:flex; align-items:center; gap:10px; padding:7px 10px;
@@ -232,13 +239,27 @@ function renderIterations(iters, currentId){
     '</h3><div style="display:flex;flex-direction:column;gap:6px">'+
     rows+'</div></div>';
 }
+// Reviewer-suggested fix-complexity tier. The dev AI uses this to route
+// fixes: A → Sonnet subagent, B → Opus (keep it), C → surface to human.
+// Reviewers may omit the field; we just don't render a badge in that case.
+const TIER_LABELS = {
+  A: { name: 'Sonnet',    title: 'Tier A — mechanical fix, OK for Sonnet' },
+  B: { name: 'Opus',      title: 'Tier B — judgment-bearing, keep on Opus' },
+  C: { name: 'Ask human', title: 'Tier C — decision-shaped, surface to human' },
+};
 function renderFindings(findings){
   if(!findings || !findings.length) return '<span class="muted">none</span>';
   return findings.map(f=>{
     const sev = (f.severity||'nit').toLowerCase();
     const loc = [f.repo,f.file,f.lines].filter(Boolean).join(' · ');
+    const tier = (f.tier||'').toString().toUpperCase();
+    const tinfo = TIER_LABELS[tier];
+    const tierBadge = tinfo
+      ? '<span class="tier tier-'+tier+'" title="'+esc(tinfo.title)+'">'+
+        esc(tier)+' · '+esc(tinfo.name)+'</span>'
+      : '';
     return '<div class="finding f-'+sev+'">'+
-      '<span class="sev sev-'+sev+'">'+esc(sev)+'</span> '+
+      '<span class="sev sev-'+sev+'">'+esc(sev)+'</span>'+tierBadge+' '+
       '<b>'+esc(f.title||'(untitled)')+'</b>'+
       (loc?'<div class="muted mono">'+esc(loc)+'</div>':'')+
       (f.detail?'<div style="margin-top:2px">'+esc(f.detail)+'</div>':'')+
