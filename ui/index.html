@@ -94,6 +94,27 @@
   .tier-A{background:#cffafe;color:#0e7490;}
   .tier-B{background:#ede9fe;color:#6d28d9;}
   .tier-C{background:#fce7f3;color:#be185d;}
+  /* submission-details card */
+  .sub-section { margin:10px 0; }
+  .sub-section:first-child { margin-top:0; }
+  .sub-label { font-size:11px; font-weight:700; text-transform:uppercase;
+               letter-spacing:0.04em; color:#64748b; margin-bottom:4px; }
+  .sub-context { padding:8px 10px; background:#f8f9fb; border:1px solid var(--line);
+                 border-radius:6px; white-space:pre-wrap; font-size:13px;
+                 line-height:1.5; }
+  .sub-flag { display:inline-block; font-size:11px; font-weight:600;
+              padding:2px 8px; border-radius:4px; margin:2px 4px 2px 0;
+              background:#e2e8f0; color:#334155; }
+  .sub-flag-warn { background:#fef3c7; color:#92400e; }
+  details.handoff-disclosure { background:#f8f9fb; border:1px solid var(--line);
+                               border-radius:6px; padding:6px 10px; }
+  details.handoff-disclosure summary { cursor:pointer; font-weight:600;
+                                       color:#1e293b; outline:none; }
+  details.handoff-disclosure[open] summary { margin-bottom:8px; }
+  details.handoff-disclosure pre { margin:0; white-space:pre-wrap;
+                                   font-family:ui-monospace,Menlo,Consolas,monospace;
+                                   font-size:12px; line-height:1.5;
+                                   max-height:480px; overflow-y:auto; }
   /* peer disagreement row inside each .finding */
   .peer { margin-top:6px; padding-top:6px; border-top:1px dashed var(--line);
           font-size:12px; line-height:1.4; }
@@ -257,6 +278,79 @@ const TIER_LABELS = {
   B: { name: 'Opus',      title: 'Tier B — judgment-bearing, keep on Opus' },
   C: { name: 'Ask human', title: 'Tier C — decision-shaped, surface to human' },
 };
+// ReviewRequest defaults — mirrored from server.py to detect deviations.
+// Keep these in sync. A field is "non-default" when its actual value differs
+// from the corresponding entry here.
+const REQ_DEFAULTS = {
+  only: [],
+  include_all: false,
+  summary_only: false,
+  no_handoff: false,
+  run_tests: true,
+  test_timeout_s: 900,
+  handoff_path: null,
+};
+function renderSubmissionCard(j, r){
+  const req = j.request || {};
+  const ctx = (req.context||'').trim();
+  const handoffSrc = r.handoff_source || '';
+  const handoffBody = r.handoff_content || '';
+  // Collect deviations from defaults — these are the flags worth surfacing.
+  const flagBits = [];
+  if((req.only||[]).length)
+    flagBits.push({label:'only: '+(req.only.length)+' glob(s)',
+                   title:(req.only||[]).join('\n'), warn:false});
+  if(req.include_all)
+    flagBits.push({label:'include_all', title:'Bypasses noise + repo-exclude filters', warn:true});
+  if(req.summary_only)
+    flagBits.push({label:'summary_only', title:'Reviewers see commit log + file stats, no line-level diff', warn:true});
+  if(req.no_handoff)
+    flagBits.push({label:'no_handoff', title:'Implementer handoff intentionally skipped', warn:true});
+  if(req.handoff_path)
+    flagBits.push({label:'handoff_path='+req.handoff_path, title:'Custom handoff path', warn:false});
+  if(req.run_tests === false)
+    flagBits.push({label:'run_tests=false', title:'Tier-1 test execution disabled', warn:true});
+  if(typeof req.test_timeout_s === 'number' && req.test_timeout_s !== REQ_DEFAULTS.test_timeout_s)
+    flagBits.push({label:'test_timeout_s='+req.test_timeout_s, title:'', warn:false});
+  // If there's literally nothing meaningful to show, render nothing.
+  if(!ctx && !handoffSrc && !handoffBody && !flagBits.length) return '';
+
+  let h = '<div class="card"><h3 style="margin:0 0 10px">Submission · what the coder AI sent</h3>';
+
+  if(ctx){
+    h += '<div class="sub-section">'+
+         '<div class="sub-label">Context (inline note from request)</div>'+
+         '<div class="sub-context">'+esc(ctx)+'</div></div>';
+  }
+
+  if(handoffSrc || handoffBody){
+    h += '<div class="sub-section"><div class="sub-label">Handoff</div>';
+    if(handoffSrc){
+      h += '<div class="mono muted" style="margin-bottom:6px">'+esc(handoffSrc)+'</div>';
+    }
+    if(handoffBody){
+      h += '<details class="handoff-disclosure">'+
+           '<summary>show handoff content ('+handoffBody.length.toLocaleString()+' chars)</summary>'+
+           '<pre>'+esc(handoffBody)+'</pre></details>';
+    } else if(handoffSrc){
+      h += '<div class="muted" style="font-size:12px">(handoff body not preserved — older job)</div>';
+    }
+    h += '</div>';
+  }
+
+  if(flagBits.length){
+    h += '<div class="sub-section"><div class="sub-label">Non-default flags</div><div>';
+    h += flagBits.map(f=>{
+      const cls = f.warn ? 'sub-flag sub-flag-warn' : 'sub-flag';
+      const t = f.title ? ' title="'+esc(f.title)+'"' : '';
+      return '<span class="'+cls+'"'+t+'>'+esc(f.label)+'</span>';
+    }).join('');
+    h += '</div></div>';
+  }
+
+  h += '</div>';
+  return h;
+}
 // Build a 1-based-index lookup for the OTHER reviewer's stance on these
 // findings. Out-of-range or duplicate finding_ids are tolerated: the last
 // well-formed entry for an id wins, others are dropped. Reviewers that
@@ -478,6 +572,10 @@ async function loadDetail(){
       '</div>';
   }
   h += '</div>';
+
+  // submission details — context + handoff (collapsible) + non-default flags.
+  // Renders nothing for legacy jobs that have none of these (defensive).
+  h += renderSubmissionCard(j, r);
 
   // feature timeline — only when tagged AND more than one iteration exists
   if(j.project && j.feature){

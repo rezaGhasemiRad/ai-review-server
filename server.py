@@ -866,6 +866,11 @@ def _lean_result(result: dict, job_id: str) -> dict:
     out = dict(result)  # shallow copy — we'll only replace specific keys
     if "transcript_md" in out:
         del out["transcript_md"]
+    # handoff_content is multi-KB markdown the consumer already has on disk
+    # (they wrote it before submitting). Keep handoff_source as a pointer;
+    # the dashboard's ?full=true fetch retrieves the body when humans need it.
+    if "handoff_content" in out:
+        del out["handoff_content"]
     out["transcript_url"] = f"/reviews/{job_id}/transcript"
 
     tr_by_repo = out.get("test_results")

@@ -1346,6 +1346,10 @@ def review_multi_repo_structured(
         progress_cb=progress_cb, tests_future=tests_future,
     )
     result["handoff_source"] = handoff_source
+    # Persist the full handoff text so the UI can render it on the detail
+    # page (collapsible "Submission" card). Stripped from the lean API
+    # response — only the dashboard's ?full=true fetch needs it.
+    result["handoff_content"] = handoff_content
     result["request"] = {
         "repos": [
             {"repo_url": r.get("repo_url"), "branch": r["branch"], "base": r["base"]}
@@ -1393,8 +1397,10 @@ def review_branch_structured(
     parts: list[str] = []
     handoff = _load_handoff(branch, repo, handoff_path, no_handoff, feature)
     handoff_source = None
+    handoff_content = None
     if handoff:
         handoff_source, content = handoff
+        handoff_content = content
         info(f"loaded handoff from {handoff_source} ({len(content):,} chars)")
         parts.append(f"## Implementer's handoff (from `{handoff_source}`)\n\n{content}")
     if context:
@@ -1408,6 +1414,7 @@ def review_branch_structured(
         progress_cb=progress_cb, tests_future=tests_future,
     )
     result["handoff_source"] = handoff_source
+    result["handoff_content"] = handoff_content
     result["request"] = {
         "repo": repo,
         "branch": branch,
