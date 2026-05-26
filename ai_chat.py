@@ -444,6 +444,92 @@ def _verdict_from_block_or_text(block: dict | None, review_md: str) -> str | Non
     return m.group(1).lower() if m else None
 
 
+def _format_findings_for_reconcile(label: str, findings: list) -> str:
+    """Render a peer reviewer's findings as a numbered markdown list for the
+    reconcile prompt. The #N IDs let the *other* reviewer reference them
+    unambiguously in their `peer_assessment` JSON output.
+    """
+    if not findings:
+        return f"# {label}'s findings\n_(none — they raised no concrete findings)_\n\n"
+    out = [f"# {label}'s findings (numbered — use these IDs in peer_assessment)"]
+    for i, f in enumerate(findings, start=1):
+        if not isinstance(f, dict):
+            out.append(f"- **#{i}** (malformed entry)")
+            continue
+        sev = f.get("severity") or "?"
+        repo = (f.get("repo") or "").strip() if isinstance(f.get("repo"), str) else ""
+        file = (f.get("file") or "").strip() if isinstance(f.get("file"), str) else ""
+        lines_field = (f.get("lines") or "").strip() if isinstance(f.get("lines"), str) else ""
+        loc_parts = [x for x in (repo, file) if x]
+        loc = "/".join(loc_parts)
+        if loc and lines_field:
+            loc = f"{loc}:{lines_field}"
+        title = f.get("title") or "(no title)"
+        detail = (f.get("detail") or "").strip() if isinstance(f.get("detail"), str) else ""
+        head = f"- **#{i}** [{sev}]"
+        if loc:
+            head += f" `{loc}`"
+        head += f" — {title}"
+        out.append(head)
+        if detail:
+            out.append(f"  {detail}")
+    return "\n".join(out) + "\n\n"
+
+
+def _extract_peer_block(text: str) -> tuple[str, list]:
+    """Pull a trailing ```json {"peer_assessment": [...]}``` block off a
+    reconcile response. Returns (clean_markdown, normalized_entries).
+    Malformed / missing block yields an empty list — never raises.
+    """
+    txt = (text or "").strip()
+    if not txt:
+        return text, []
+    # Same shape as _extract_findings_block — closing fence optional, since
+    # Codex sometimes omits it. The trailing-block constraint is safe because
+    # reconcile prose doesn't otherwise contain fenced JSON.
+    m = re.search(r"```json\s*(\{.*\})\s*(?:```)?\s*$", txt, re.DOTALL)
+    if not m:
+        return text, []
+    try:
+        data = json.loads(m.group(1))
+    except (json.JSONDecodeError, ValueError):
+        return text, []
+    if not isinstance(data, dict):
+        return text, []
+    arr = data.get("peer_assessment")
+    if not isinstance(arr, list):
+        return text, []
+    clean = txt[: m.start()].rstrip()
+    return clean, _normalize_peer_entries(arr)
+
+
+def _normalize_peer_entries(entries: list) -> list:
+    """Coerce peer_assessment entries to a uniform shape. Drops entries that
+    can't be coerced; clamps stance to {agree, disagree, unsure}."""
+    valid = {"agree", "disagree", "unsure"}
+    out: list[dict] = []
+    for e in entries or []:
+        if not isinstance(e, dict):
+            continue
+        fid_raw = e.get("finding_id")
+        if isinstance(fid_raw, bool):
+            continue
+        if isinstance(fid_raw, int):
+            fid = fid_raw
+        else:
+            try:
+                fid = int(str(fid_raw).strip())
+            except (TypeError, ValueError):
+                continue
+        stance = str(e.get("stance") or "").strip().lower()
+        if stance not in valid:
+            stance = "unsure"
+        note = e.get("note")
+        note = note.strip() if isinstance(note, str) else ""
+        out.append({"finding_id": fid, "stance": stance, "note": note})
+    return out
+
+
 def load_code_input(
     file_path: str | None,
     diff_ref: str | None,
@@ -899,6 +985,9 @@ def _run_review_pipeline(
         )
         claude_reconcile = skip_note
         codex_reconcile = skip_note
+        # No findings → no peer to assess.
+        claude_peer_assessment: list = []
+        codex_peer_assessment: list = []
         history.append({"speaker": "claude (reconcile)", "text": claude_reconcile})
         history.append({"speaker": "codex (reconcile)", "text": codex_reconcile})
         cb("finalizing")
@@ -946,13 +1035,52 @@ def _run_review_pipeline(
             "Tier-1 tests are a hard block regardless of how the diff looks."
             if (tests_deferred and test_block) else ""
         )
+        claude_findings_section = _format_findings_for_reconcile(
+            "Reviewer A (Claude)", claude_findings_p1
+        )
+        codex_findings_section = _format_findings_for_reconcile(
+            "Reviewer B (Codex)", codex_findings_p1
+        )
+
+        # Disagreement-matrix instructions. Same message goes to both
+        # reviewers; the role prompt (system message) tells each model who
+        # they are, and the wording below tells each which numbered list to
+        # assess. This keeps the prompt cacheable across the two parallel
+        # reconcile calls.
+        peer_instruction = (
+            "\n\n## Peer assessment (disagreement matrix)\n"
+            "In addition to your reconcile prose above, you must end your "
+            "response with a fenced ```json code block — and NOTHING after it — "
+            "matching this exact shape:\n"
+            '{"peer_assessment": [{"finding_id": <N>, "stance": '
+            '"agree|disagree|unsure", "note": "<short reason>"}]}\n\n'
+            "Rules:\n"
+            "- If you are **Reviewer A (Claude)**, the `finding_id` values "
+            "refer to **Reviewer B (Codex)'s** numbered findings above. "
+            "Do NOT grade your own findings.\n"
+            "- If you are **Reviewer B (Codex)**, the `finding_id` values "
+            "refer to **Reviewer A (Claude)'s** numbered findings above. "
+            "Do NOT grade your own findings.\n"
+            "- Cover EVERY finding the other reviewer raised. One entry per "
+            "finding, in order.\n"
+            "- Use `disagree` only when you can name a concrete reason "
+            "(false positive, misread of the code, contradicted by the diff). "
+            "`unsure` is fine if you can't verify against the trimmed diff.\n"
+            "- `note` is one short sentence — your rationale. Empty string is "
+            "OK for plain `agree`.\n"
+            "- If the other reviewer raised zero findings, emit "
+            '`{"peer_assessment": []}` and nothing else.'
+        )
+
         reconcile_msg = (
             f"{context_block}"
             f"{prior_block}"
             f"{test_block}"
             f"# Code under review ({label})\n\n{reconcile_payload}\n\n"
             f"# Reviewer A — Claude's review\n{claude_review}\n\n"
+            f"{claude_findings_section}"
             f"# Reviewer B — Codex's review\n{codex_review}\n\n"
+            f"{codex_findings_section}"
             f"# Your task\n"
             f"You have just seen both independent reviews above. Focus ONLY on points where the "
             f"two reviews disagree, or where one reviewer caught something the other missed. "
@@ -962,6 +1090,7 @@ def _run_review_pipeline(
             f"points both reviews already agree on."
             + trim_note
             + tests_in_reconcile_note
+            + peer_instruction
         )
 
         cb("phase 2/2 · Claude+Codex reconciling in parallel")
@@ -972,6 +1101,15 @@ def _run_review_pipeline(
             codex_reconcile, u_x = fut_x.result()
         _add("claude", u_c)
         _add("codex", u_x)
+        # Peel the peer-assessment JSON off each reconcile output before
+        # storing/displaying. claude_peer_assessment is Claude's stances on
+        # Codex's findings (and vice versa).
+        claude_reconcile, claude_peer_assessment = _extract_peer_block(claude_reconcile)
+        codex_reconcile, codex_peer_assessment = _extract_peer_block(codex_reconcile)
+        info(
+            f"peer assessments: claude→codex {len(claude_peer_assessment)} entries, "
+            f"codex→claude {len(codex_peer_assessment)} entries"
+        )
         speak("claude", claude_reconcile)
         speak("codex", codex_reconcile)
         history.append({"speaker": "claude (reconcile)", "text": claude_reconcile})
@@ -1004,6 +1142,13 @@ def _run_review_pipeline(
         "codex_reconcile": codex_reconcile,
         "claude_findings": claude_findings,
         "codex_findings": codex_findings,
+        # Disagreement matrix: each reviewer's stance on the OTHER's
+        # findings. `claude_peer_assessment` = Claude's stances on Codex's
+        # findings; `codex_peer_assessment` = Codex's stances on Claude's
+        # findings. `finding_id` refers to the index (1-based) into the
+        # corresponding peer's findings array.
+        "claude_peer_assessment": claude_peer_assessment,
+        "codex_peer_assessment": codex_peer_assessment,
         "claude_verdict": _verdict_from_block_or_text(claude_block, claude_review),
         "codex_verdict": _verdict_from_block_or_text(codex_block, codex_review),
         "usage": usage,
