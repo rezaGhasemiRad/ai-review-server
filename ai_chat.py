@@ -1298,7 +1298,7 @@ def review_multi_repo_structured(
     progress_cb=None,
     feature: str | None = None,
     tests_future: Future | None = None,
-    caller_depth: int = 1,
+    caller_depth: int = 2,
 ) -> dict:
     """Run a single review whose subject is changes across multiple repos.
 
@@ -1454,7 +1454,7 @@ def review_branch_structured(
     progress_cb=None,
     feature: str | None = None,
     tests_future: Future | None = None,
-    caller_depth: int = 1,
+    caller_depth: int = 2,
 ) -> dict:
     """Server-friendly entrypoint. Runs a branch review and returns a structured result.
 

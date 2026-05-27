@@ -96,6 +96,12 @@ except ValueError:
     OPUS_5H_BUDGET_USD = 75.0
 OPUS_PLAN_LABEL = os.environ.get("OPUS_PLAN_LABEL", "Max 5×").strip() or "Max 5×"
 
+# Default caller-context depth for symbol-graph analysis (task #10).
+# Submissions above this trigger the approval gate. Currently the
+# validator caps depth at 2, so depth>DEFAULT never happens — the gate
+# code is preserved for if depth=3+ is added later.
+DEFAULT_CALLER_DEPTH = 2
+
 
 def _rolling_review_usd_5h(now: float | None = None, exclude_job_id: str | None = None) -> tuple[float, int]:
     """Sum the Claude USD spent across this server's reviews completed in the
@@ -378,13 +384,14 @@ class ReviewRequest(BaseModel):
     feature: Optional[str] = None
 
     # Symbol-graph caller-context analysis (task #10).
-    # 1 = direct callers only (default; ~3-8K extra tokens, ~70% catch rate
+    # 1 = direct callers only (~3-8K extra tokens, ~70% catch rate
     #     of cross-cut bugs).
-    # 2 = one hop of indirect callers added, tagged separately
-    #     (~10-25K extra tokens, ~85% catch rate). Triggers an approval
-    #     gate: the job starts in 'awaiting_approval' status and only
-    #     runs after the user POSTs to /reviews/{id}/approve-depth.
-    caller_depth: int = 1
+    # 2 = direct + one hop of indirect callers tagged separately
+    #     (~10-25K extra tokens, ~85% catch rate). NEW DEFAULT.
+    # Approval gate (status=awaiting_approval) only triggers when
+    # caller_depth > DEFAULT_CALLER_DEPTH — kept in place for if
+    # depth>2 is ever added, but no current submission hits it.
+    caller_depth: int = 2
 
     @field_validator("project", "feature")
     @classmethod
@@ -711,10 +718,10 @@ def _run_job(job_id: str) -> None:
             progress_cb=progress,
             feature=job_feature,   # enables .ai-collab/handoffs/<feature>.md discovery
             tests_future=tests_future,
-            # Symbol-graph caller-context analysis (task #10). Depth 2 is
-            # gated by the approval flow; by the time _run_job runs, the
-            # request has already been approved if depth>1.
-            caller_depth=int(req.get("caller_depth", 1)),
+            # Symbol-graph caller-context analysis (task #10). Default is 2
+            # (depth + one hop of indirect callers tagged). Anything above
+            # the default goes through the approval gate before this point.
+            caller_depth=int(req.get("caller_depth", DEFAULT_CALLER_DEPTH)),
         )
 
         if len(prepared) == 1:
@@ -900,10 +907,11 @@ def submit_review(req: ReviewRequest, request: Request) -> JobSubmitted:
             feature = feature or prior.get("feature")
 
     job_id = uuid.uuid4().hex
-    # Approval gate for caller_depth > 1: the coder AI requests the deeper
-    # analysis, the human approves before the more-expensive review runs.
-    # depth=1 jobs queue immediately as before.
-    needs_approval = req.caller_depth > 1
+    # Approval gate for caller_depth above the default. Default is 2, so
+    # only depth>2 (currently not allowed by the validator — kept for
+    # future depth=3+ implementation) requires explicit approval. depth=1
+    # and depth=2 both queue immediately.
+    needs_approval = req.caller_depth > DEFAULT_CALLER_DEPTH
     initial_status = "awaiting_approval" if needs_approval else "queued"
     job = {
         "job_id": job_id,

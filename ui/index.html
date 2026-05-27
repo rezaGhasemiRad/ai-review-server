@@ -317,7 +317,7 @@ const REQ_DEFAULTS = {
   run_tests: true,
   test_timeout_s: 900,
   handoff_path: null,
-  caller_depth: 1,
+  caller_depth: 2,
 };
 function renderSubmissionCard(j, r){
   const req = j.request || {};
@@ -341,12 +341,20 @@ function renderSubmissionCard(j, r){
     flagBits.push({label:'run_tests=false', title:'Tier-1 test execution disabled', warn:true});
   if(typeof req.test_timeout_s === 'number' && req.test_timeout_s !== REQ_DEFAULTS.test_timeout_s)
     flagBits.push({label:'test_timeout_s='+req.test_timeout_s, title:'', warn:false});
-  if(typeof req.caller_depth === 'number' && req.caller_depth !== REQ_DEFAULTS.caller_depth)
+  if(typeof req.caller_depth === 'number' && req.caller_depth !== REQ_DEFAULTS.caller_depth){
+    // Default depth is now 2 (direct + 1 hop). Deviations either direction
+    // are surfaced: depth=1 (shallower than default, cheaper but misses
+    // indirect callers) is informational; depth>2 (deeper than default,
+    // approval-gated) is warn-flagged.
+    const deeper = req.caller_depth > REQ_DEFAULTS.caller_depth;
     flagBits.push({
       label:'caller_depth='+req.caller_depth,
-      title:'Symbol-graph caller analysis: depth 2 surfaces indirect callers (1 hop). Requires approval before the review runs.',
-      warn:true,
+      title: deeper
+        ? 'Symbol-graph caller analysis: deeper than default. Requires approval before the review runs.'
+        : 'Symbol-graph caller analysis: shallower than default (depth=1 surfaces direct callers only).',
+      warn: deeper,
     });
+  }
   // If there's literally nothing meaningful to show, render nothing.
   if(!ctx && !handoffSrc && !handoffBody && !flagBits.length) return '';
 
