@@ -85,6 +85,98 @@ def _load_env_file(path: pathlib.Path) -> dict:
 
 TELEGRAM = _load_env_file(ALERTS_ENV)
 
+# Subscription-window budget for the per-job % display. The user's coder AI
+# and the review server's Claude calls share the same Anthropic account's
+# 5-hour Opus quota, so the cost of each review is meaningfully read against
+# this budget. Defaults are tuned for Claude Code Max 5×; tweak via env to
+# match your actual plan tier.
+try:
+    OPUS_5H_BUDGET_USD = float(os.environ.get("OPUS_5H_BUDGET_USD", "75"))
+except ValueError:
+    OPUS_5H_BUDGET_USD = 75.0
+OPUS_PLAN_LABEL = os.environ.get("OPUS_PLAN_LABEL", "Max 5×").strip() or "Max 5×"
+
+
+def _rolling_review_usd_5h(now: float | None = None, exclude_job_id: str | None = None) -> tuple[float, int]:
+    """Sum the Claude USD spent across this server's reviews completed in the
+    last 5 hours. This is the *review server's* contribution to the user's
+    Anthropic-account 5h Opus window — coder AI sessions and other projects
+    on the same account stay invisible and must be added mentally.
+
+    Returns (total_usd, job_count). Scans in-memory jobs first; that's
+    typically enough since completed jobs stay in JOBS until restart.
+    """
+    import time as _time
+    if now is None:
+        now = _time.time()
+    horizon = now - 5 * 3600
+    total = 0.0
+    count = 0
+    with JOBS_LOCK:
+        snapshot = list(JOBS.items())
+    for jid, job in snapshot:
+        if exclude_job_id is not None and jid == exclude_job_id:
+            continue
+        if not isinstance(job, dict) or job.get("status") != "complete":
+            continue
+        # completed_at is an ISO-8601 string ("YYYY-MM-DDTHH:MM:SSZ"); parse.
+        ct = job.get("completed_at") or ""
+        try:
+            import datetime as _dt
+            ts = _dt.datetime.fromisoformat(ct.replace("Z", "+00:00")).timestamp()
+        except (ValueError, AttributeError):
+            continue
+        if ts < horizon:
+            continue
+        claude_usd = ((job.get("result") or {}).get("usage") or {}).get("claude", {}).get("usd")
+        try:
+            total += float(claude_usd or 0)
+            if claude_usd:
+                count += 1
+        except (TypeError, ValueError):
+            continue
+    return round(total, 4), count
+
+
+def _window_pct(claude_usd: float | int | None, job_id: str | None = None) -> dict | None:
+    """Compute this job's share of the user's 5h Opus subscription window,
+    plus the rolling 5h aggregate from this server.
+
+    Returns None when there's nothing meaningful to show (no Claude cost,
+    or budget disabled). Otherwise a dict the UI and Telegram notification
+    both render — single source of truth so the % matches everywhere.
+
+    The rolling aggregate includes this job (when it's in JOBS) PLUS every
+    other review completed in the trailing 5h. The disclosure note makes
+    explicit that coder AI sessions and other-project Claude usage on the
+    same Anthropic account aren't counted — we can't see them.
+    """
+    try:
+        usd = float(claude_usd or 0)
+    except (TypeError, ValueError):
+        return None
+    if usd <= 0 or OPUS_5H_BUDGET_USD <= 0:
+        return None
+    # Rolling 5h is computed from the in-memory job table. We pass the
+    # current job_id to dedupe — if this job is already in JOBS (the normal
+    # case at GET time), we add `usd` separately to avoid double-counting.
+    other_usd, other_count = _rolling_review_usd_5h(exclude_job_id=job_id)
+    rolling_usd = round(usd + other_usd, 4)
+    return {
+        "claude_usd": round(usd, 4),
+        "budget_usd": OPUS_5H_BUDGET_USD,
+        "plan_label": OPUS_PLAN_LABEL,
+        "pct": round(usd / OPUS_5H_BUDGET_USD * 100, 2),
+        "rolling_5h_usd": rolling_usd,
+        "rolling_5h_pct": round(rolling_usd / OPUS_5H_BUDGET_USD * 100, 2),
+        "rolling_5h_job_count": other_count + 1,
+        "note": (
+            "Rolling 5h reflects ONLY this review server's contribution. "
+            "Coder AI sessions, claude.ai chats, and other projects on the "
+            "same Anthropic account aren't counted — add them mentally."
+        ),
+    }
+
 
 def _telegram_reply(text: str) -> None:
     """Send a message back to the configured Telegram chat."""
@@ -131,12 +223,21 @@ def _notify_job_done(job_id: str) -> None:
         usage = result.get("usage") or {}
         tin = usage.get("total_input_tokens") or 0
         tout = usage.get("total_output_tokens") or 0
+        claude_usd = (usage.get("claude") or {}).get("usd")
+        w = _window_pct(claude_usd, job_id=job_id)
         body = (
             f"Review COMPLETE — {pf}\n"
             f"Claude: {cv} ({cf} findings)\n"
             f"Codex:  {xv} ({xf} findings)\n"
             f"Tokens: {tin:,} in / {tout:,} out\n"
         )
+        if w:
+            body += (
+                f"Window: {w['pct']:.2f}% this job · "
+                f"{w['rolling_5h_pct']:.1f}% last 5h "
+                f"({w['rolling_5h_job_count']} review(s), "
+                f"{w['plan_label']}, excludes other Claude usage)\n"
+            )
     else:
         err = (job.get("error") or "").strip()
         body = f"Review FAILED — {pf}\nError: {err[:300]}\n"
@@ -872,6 +973,15 @@ def _lean_result(result: dict, job_id: str) -> dict:
     if "handoff_content" in out:
         del out["handoff_content"]
     out["transcript_url"] = f"/reviews/{job_id}/transcript"
+    # Surface "this job consumed X% of your 5h Opus window" plus a rolling
+    # 5h aggregate from this server — clearly disclosed as NOT including
+    # coder AI sessions or other-project Claude usage on the same account.
+    w = _window_pct(
+        ((out.get("usage") or {}).get("claude") or {}).get("usd"),
+        job_id=job_id,
+    )
+    if w is not None:
+        out["subscription_window"] = w
 
     tr_by_repo = out.get("test_results")
     if isinstance(tr_by_repo, dict):
@@ -907,9 +1017,21 @@ def get_review(job_id: str, full: bool = False):
     # Strip in-memory-only keys (e.g. _future from /cancel) — they aren't
     # JSON-serializable and FastAPI would 500 otherwise.
     cleaned = {k: v for k, v in job.items() if not k.startswith("_")}
-    if full:
-        return cleaned
     result = cleaned.get("result")
+    if full:
+        # Full path keeps transcript_md / handoff_content but still gets the
+        # subscription_window field so UI + consumers don't have to compute
+        # it themselves regardless of which endpoint flavor they fetched.
+        if isinstance(result, dict):
+            w = _window_pct(
+                ((result.get("usage") or {}).get("claude") or {}).get("usd"),
+                job_id=job_id,
+            )
+            if w is not None:
+                result = dict(result)
+                result["subscription_window"] = w
+                cleaned["result"] = result
+        return cleaned
     if isinstance(result, dict):
         cleaned["result"] = _lean_result(result, job_id)
     return cleaned
