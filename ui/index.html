@@ -115,6 +115,34 @@
                                    font-family:ui-monospace,Menlo,Consolas,monospace;
                                    font-size:12px; line-height:1.5;
                                    max-height:480px; overflow-y:auto; }
+  /* Awaiting-approval banner (caller_depth>1) */
+  .approval-banner { padding:14px 16px; background:#fef3c7; border:1px solid #fbbf24;
+                     border-left:4px solid #d97706; border-radius:6px;
+                     margin-bottom:14px; }
+  .approval-banner h3 { margin:0 0 6px; color:#92400e; font-size:15px; }
+  .approval-banner p { margin:6px 0; font-size:13px; line-height:1.5;
+                       color:#78350f; }
+  .approval-actions { margin-top:10px; display:flex; gap:8px; flex-wrap:wrap; }
+  .btn-approve { background:#15803d; color:#fff; border:1px solid #166534;
+                 padding:6px 14px; border-radius:5px; font-size:13px;
+                 font-weight:600; cursor:pointer; }
+  .btn-approve:hover { background:#166534; }
+  .btn-reject { background:#fff; color:#b91c1c; border:1px solid #ef4444;
+                padding:6px 14px; border-radius:5px; font-size:13px;
+                font-weight:600; cursor:pointer; }
+  .btn-reject:hover { background:#fee2e2; }
+  /* Caller-context card (task #10) */
+  details.caller-disclosure { background:#f8f9fb; border:1px solid var(--line);
+                              border-radius:6px; padding:6px 10px; }
+  details.caller-disclosure summary { cursor:pointer; font-weight:600;
+                                      color:#1e293b; outline:none; }
+  details.caller-disclosure[open] summary { margin-bottom:8px; }
+  details.caller-disclosure pre { margin:0; white-space:pre-wrap;
+                                  font-family:ui-monospace,Menlo,Consolas,monospace;
+                                  font-size:12px; line-height:1.5;
+                                  max-height:600px; overflow-y:auto; }
+  /* Status badge for awaiting_approval */
+  .v-awaiting_approval { background:#fef3c7; color:#92400e; }
   /* peer disagreement row inside each .finding */
   .peer { margin-top:6px; padding-top:6px; border-top:1px dashed var(--line);
           font-size:12px; line-height:1.4; }
@@ -289,6 +317,7 @@ const REQ_DEFAULTS = {
   run_tests: true,
   test_timeout_s: 900,
   handoff_path: null,
+  caller_depth: 1,
 };
 function renderSubmissionCard(j, r){
   const req = j.request || {};
@@ -312,6 +341,12 @@ function renderSubmissionCard(j, r){
     flagBits.push({label:'run_tests=false', title:'Tier-1 test execution disabled', warn:true});
   if(typeof req.test_timeout_s === 'number' && req.test_timeout_s !== REQ_DEFAULTS.test_timeout_s)
     flagBits.push({label:'test_timeout_s='+req.test_timeout_s, title:'', warn:false});
+  if(typeof req.caller_depth === 'number' && req.caller_depth !== REQ_DEFAULTS.caller_depth)
+    flagBits.push({
+      label:'caller_depth='+req.caller_depth,
+      title:'Symbol-graph caller analysis: depth 2 surfaces indirect callers (1 hop). Requires approval before the review runs.',
+      warn:true,
+    });
   // If there's literally nothing meaningful to show, render nothing.
   if(!ctx && !handoffSrc && !handoffBody && !flagBits.length) return '';
 
@@ -427,6 +462,49 @@ async function cancelJob(id){
   if(openJobId===id) loadDetail(); else loadList();
 }
 
+// Approve a caller_depth>1 job. Transitions awaiting_approval → queued and
+// kicks off the review immediately. Confirmation dialog spells out the
+// token cost since depth-2 reviews are meaningfully more expensive.
+async function approveDepth(id){
+  if(!confirm(
+    'Approve caller_depth=2 for this review?\n\n' +
+    'Adds ~10-25K extra input tokens (~85% catch rate of cross-cut bugs, ' +
+    'up from ~70% at depth 1). The review will start running immediately.'
+  )) return;
+  const r = await fetch('/reviews/'+id+'/approve-depth',
+    { method:'POST', headers:{ 'Authorization':'Bearer '+KEY } });
+  if(!r.ok){
+    let msg = 'HTTP '+r.status;
+    try { msg = (await r.json()).detail || msg; } catch(e){}
+    alert('Could not approve: '+msg);
+    return;
+  }
+  if(openJobId===id) loadDetail(); else loadList();
+}
+
+// Reject a caller_depth>1 job with a reason. Marks errored; coder AI can
+// resubmit with caller_depth=1 to bypass the approval gate.
+async function rejectDepth(id){
+  const reason = prompt(
+    'Reject this caller_depth=2 request?\n\n' +
+    'Reason (shown to the coder AI, optional):',
+    'Not worth the extra tokens for this iteration'
+  );
+  if(reason === null) return;  // cancelled
+  const r = await fetch('/reviews/'+id+'/reject-depth', {
+    method:'POST',
+    headers:{ 'Authorization':'Bearer '+KEY, 'Content-Type':'application/json' },
+    body: JSON.stringify({ reason: reason }),
+  });
+  if(!r.ok){
+    let msg = 'HTTP '+r.status;
+    try { msg = (await r.json()).detail || msg; } catch(e){}
+    alert('Could not reject: '+msg);
+    return;
+  }
+  if(openJobId===id) loadDetail(); else loadList();
+}
+
 async function loadRepos(){
   try {
     const d = await api('/repos');
@@ -468,7 +546,7 @@ async function loadList(){
     const archBtn = '<button class="mini" onclick="event.stopPropagation();'+
       'archiveJob(\''+j.job_id+'\','+(showArchived?'false':'true')+')">'+
       (showArchived?'Restore':'Archive')+'</button>';
-    const cancelBtn = (j.status==='queued')
+    const cancelBtn = (j.status==='queued' || j.status==='awaiting_approval')
       ? '<button class="mini" style="margin-right:6px" '+
         'onclick="event.stopPropagation();cancelJob(\''+j.job_id+'\')">Cancel</button>'
       : '';
@@ -536,7 +614,7 @@ async function loadDetail(){
     '<span class="mono muted">'+j.job_id+'</span>'+
     (isArch?'<span class="muted">· archived</span>':'')+
     '<span style="flex:1"></span>'+
-    (j.status==='queued'
+    ((j.status==='queued' || j.status==='awaiting_approval')
       ? '<button class="mini" style="margin-right:6px" onclick="cancelJob(\''+j.job_id+'\')">Cancel</button>'
       : '')+
     '<button class="mini" onclick="archiveJob(\''+j.job_id+'\','+(isArch?'false':'true')+')">'+
@@ -592,9 +670,62 @@ async function loadDetail(){
   }
   h += '</div>';
 
+  // Awaiting-approval banner (task #10 caller_depth>1 gate). Fires only
+  // when the job is currently in awaiting_approval state. Provides the
+  // approve/reject affordances right at the top of the detail page so the
+  // human doesn't have to hunt for them.
+  if(j.status === 'awaiting_approval'){
+    const depth = (j.request && j.request.caller_depth) || 2;
+    h += '<div class="approval-banner">'+
+      '<h3>Approval required: caller_depth='+depth+'</h3>'+
+      '<p>The coder AI requested deeper symbol-graph caller-context analysis '+
+      '(direct callers + one hop of indirect callers, tagged). This adds '+
+      'roughly 10-25K extra input tokens per review and raises the cross-cut '+
+      'bug catch rate from ~70% to ~85%. The review will not run until you '+
+      'approve.</p>'+
+      '<div class="approval-actions">'+
+        '<button class="btn-approve" onclick="approveDepth(\''+j.job_id+'\')">'+
+          'Approve and run review</button>'+
+        '<button class="btn-reject" onclick="rejectDepth(\''+j.job_id+'\')">'+
+          'Reject (mark errored)</button>'+
+      '</div></div>';
+  }
+
   // submission details — context + handoff (collapsible) + non-default flags.
   // Renders nothing for legacy jobs that have none of these (defensive).
   h += renderSubmissionCard(j, r);
+
+  // Caller-context card (task #10). Shows what the symbol-graph analysis
+  // surfaced for the reviewers — depth, counts, the full markdown section
+  // that was injected into the reviewer prompt. Collapsed by default.
+  const cc = r.caller_context;
+  if(cc && (cc.section_md || (cc.per_repo||[]).length)){
+    h += '<div class="card"><h3 style="margin:0 0 10px">'+
+      'Caller context · what reviewers saw beyond the diff</h3>';
+    h += '<div class="muted" style="font-size:12px;margin-bottom:8px">'+
+      'depth='+(cc.depth_used||1)+' &nbsp;·&nbsp; '+
+      (cc.total_callers_included||0)+' caller(s) included &nbsp;·&nbsp; '+
+      (cc.total_bytes||0).toLocaleString()+' chars in payload'+
+      '</div>';
+    const per = cc.per_repo || [];
+    if(per.length){
+      h += '<div class="muted mono" style="font-size:12px;margin-bottom:8px">';
+      h += per.map(p =>
+        esc(shortRepo(p.repo||''))+': '+
+        (p.callers_included||0)+' shown · '+
+        (p.callers_truncated||0)+' elided · '+
+        'syms: '+((p.changed_symbols||[]).join(', ')||'—')
+      ).join('<br>');
+      h += '</div>';
+    }
+    if(cc.section_md){
+      h += '<details class="caller-disclosure">'+
+        '<summary>show full caller-context markdown ('+
+        (cc.section_md.length||0).toLocaleString()+' chars)</summary>'+
+        '<pre>'+esc(cc.section_md)+'</pre></details>';
+    }
+    h += '</div>';
+  }
 
   // feature timeline — only when tagged AND more than one iteration exists
   if(j.project && j.feature){

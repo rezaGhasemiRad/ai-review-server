@@ -247,6 +247,29 @@ def _notify_job_done(job_id: str) -> None:
     _telegram_reply(body)
 
 
+def _notify_awaiting_approval(job_id: str) -> None:
+    """Telegram nudge when a job lands in 'awaiting_approval' state.
+    Different shape from _notify_job_done — actionable, not a completion."""
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+    if job is None:
+        return
+    pf = (job.get("project") or "—") + " / " + (job.get("feature") or "—")
+    req = job.get("request", {}) or {}
+    depth = req.get("caller_depth", 1)
+    link = _job_link(job_id)
+    body = (
+        f"Review AWAITING APPROVAL — {pf}\n"
+        f"Coder AI requested caller_depth={depth} "
+        f"(deeper symbol-graph analysis; ~10-25K extra tokens, "
+        f"~85% catch rate of cross-cut bugs).\n"
+        f"Approve or reject in the dashboard."
+    )
+    if link:
+        body += "\n" + link
+    _telegram_reply(body)
+
+
 def _rotate_api_key() -> str:
     """Generate a new API key, persist it to SERVER_ENV, swap it in live."""
     global API_KEY
@@ -354,6 +377,15 @@ class ReviewRequest(BaseModel):
     project: Optional[str] = None
     feature: Optional[str] = None
 
+    # Symbol-graph caller-context analysis (task #10).
+    # 1 = direct callers only (default; ~3-8K extra tokens, ~70% catch rate
+    #     of cross-cut bugs).
+    # 2 = one hop of indirect callers added, tagged separately
+    #     (~10-25K extra tokens, ~85% catch rate). Triggers an approval
+    #     gate: the job starts in 'awaiting_approval' status and only
+    #     runs after the user POSTs to /reviews/{id}/approve-depth.
+    caller_depth: int = 1
+
     @field_validator("project", "feature")
     @classmethod
     def _check_label(cls, v: Optional[str]) -> Optional[str]:
@@ -381,6 +413,17 @@ class ReviewRequest(BaseModel):
         if not SAFE_REF_RE.match(v):
             raise ValueError("ref names must match [A-Za-z0-9_./-]+")
         return v
+
+    @field_validator("caller_depth")
+    @classmethod
+    def _check_caller_depth(cls, v: int) -> int:
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            raise ValueError("caller_depth must be an integer (1 or 2)")
+        if n not in (1, 2):
+            raise ValueError("caller_depth must be 1 or 2 (depth>2 is not supported)")
+        return n
 
     def normalized_repos(self) -> list[RepoSpec]:
         """Always return a non-empty list of RepoSpec, validating the either/or shape."""
@@ -668,6 +711,10 @@ def _run_job(job_id: str) -> None:
             progress_cb=progress,
             feature=job_feature,   # enables .ai-collab/handoffs/<feature>.md discovery
             tests_future=tests_future,
+            # Symbol-graph caller-context analysis (task #10). Depth 2 is
+            # gated by the approval flow; by the time _run_job runs, the
+            # request has already been approved if depth>1.
+            caller_depth=int(req.get("caller_depth", 1)),
         )
 
         if len(prepared) == 1:
@@ -853,9 +900,14 @@ def submit_review(req: ReviewRequest, request: Request) -> JobSubmitted:
             feature = feature or prior.get("feature")
 
     job_id = uuid.uuid4().hex
+    # Approval gate for caller_depth > 1: the coder AI requests the deeper
+    # analysis, the human approves before the more-expensive review runs.
+    # depth=1 jobs queue immediately as before.
+    needs_approval = req.caller_depth > 1
+    initial_status = "awaiting_approval" if needs_approval else "queued"
     job = {
         "job_id": job_id,
-        "status": "queued",
+        "status": initial_status,
         "created_at": _now(),
         "project": project,
         "feature": feature,
@@ -865,16 +917,30 @@ def submit_review(req: ReviewRequest, request: Request) -> JobSubmitted:
     with JOBS_LOCK:
         JOBS[job_id] = job
     _persist(job)
+
+    summary = ", ".join(f"{r.repo_url}@{r.branch}" for r in repos)
+    base_url = str(request.base_url).rstrip("/")
+
+    if needs_approval:
+        log.info(
+            "job %s queued AWAITING APPROVAL [project=%s feature=%s caller_depth=%d] across %d repo(s): %s",
+            job_id, project, feature, req.caller_depth, len(repos), summary,
+        )
+        # Telegram nudge so the human knows there's an approval to make.
+        _notify_awaiting_approval(job_id)
+        return JobSubmitted(
+            job_id=job_id, status=initial_status,
+            status_url=f"{base_url}/reviews/{job_id}",
+        )
+
     fut = EXECUTOR.submit(_run_job, job_id)
     # Hold the Future in-memory so /cancel can call .cancel() on a queued job.
     # The leading underscore keeps _persist from trying to serialize it.
     with JOBS_LOCK:
         if job_id in JOBS:
             JOBS[job_id]["_future"] = fut
-    summary = ", ".join(f"{r.repo_url}@{r.branch}" for r in repos)
     log.info("queued job %s [project=%s feature=%s] across %d repo(s): %s",
              job_id, project, feature, len(repos), summary)
-    base_url = str(request.base_url).rstrip("/")
     return JobSubmitted(
         job_id=job_id, status="queued", status_url=f"{base_url}/reviews/{job_id}"
     )
@@ -1223,7 +1289,10 @@ def cancel_job(job_id: str):
             detail="cannot cancel a running job; let it finish or restart the server",
         )
 
-    # status == "queued": try to remove from the executor's queue, then mark errored.
+    # status == "queued" OR "awaiting_approval": if queued, try to remove
+    # from the executor's queue. awaiting_approval has no future yet (the
+    # job was never submitted to the executor), so the cancel is purely a
+    # state transition.
     fut = job.get("_future") if isinstance(job, dict) else None
     cancelled = fut.cancel() if fut else False
     with JOBS_LOCK:
@@ -1244,6 +1313,88 @@ def cancel_job(job_id: str):
             "future_cancelled": cancelled,
             "note": "queued job removed from queue" if cancelled
                     else "future could not be cancelled (already running?) — marked errored"}
+
+
+@app.post("/reviews/{job_id}/approve-depth", dependencies=[Depends(require_bearer)])
+def approve_review_depth(job_id: str):
+    """Approve a caller_depth>1 review and start it running.
+
+    Idempotent for already-queued or terminal jobs (returns 200 with note).
+    Returns 409 if the job isn't in 'awaiting_approval' state — that
+    catches double-approves and approvals of jobs that were cancelled
+    while waiting."""
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+    if job is None:
+        job = _load_from_disk(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+    status = job.get("status")
+    if status in ("queued", "running", "complete", "error"):
+        return {"job_id": job_id, "status": status,
+                "note": f"already {status}; nothing to approve"}
+    if status != "awaiting_approval":
+        raise HTTPException(
+            status_code=409,
+            detail=f"cannot approve job in state '{status}'",
+        )
+    # Transition to queued + submit to executor.
+    with JOBS_LOCK:
+        jr = JOBS.get(job_id)
+        if jr is None:
+            raise HTTPException(status_code=404, detail="job vanished from registry")
+        jr["status"] = "queued"
+        jr["approved_at"] = _now()
+        _persist(jr)
+    fut = EXECUTOR.submit(_run_job, job_id)
+    with JOBS_LOCK:
+        if job_id in JOBS:
+            JOBS[job_id]["_future"] = fut
+    log.info("job %s approved and queued for execution", job_id)
+    return {"job_id": job_id, "status": "queued",
+            "note": "approved; submitted to executor"}
+
+
+@app.post("/reviews/{job_id}/reject-depth", dependencies=[Depends(require_bearer)])
+def reject_review_depth(job_id: str, payload: Optional[dict] = None):
+    """Reject a caller_depth>1 review with an optional reason. Marks the
+    job as errored; the coder AI can resubmit with caller_depth=1 to bypass
+    the approval gate.
+
+    Body: {"reason": "<short string>"} — optional. Reason gets surfaced in
+    the job's error field + Telegram notification."""
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+    if job is None:
+        job = _load_from_disk(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+    status = job.get("status")
+    if status in ("complete", "error"):
+        return {"job_id": job_id, "status": status,
+                "note": "already terminal"}
+    if status != "awaiting_approval":
+        raise HTTPException(
+            status_code=409,
+            detail=f"cannot reject job in state '{status}'; "
+                   f"only awaiting_approval jobs can be rejected",
+        )
+    reason = ""
+    if isinstance(payload, dict):
+        reason = str(payload.get("reason") or "").strip()
+    if not reason:
+        reason = "caller_depth rejected by user"
+    with JOBS_LOCK:
+        jr = JOBS.get(job_id)
+        if jr is None:
+            raise HTTPException(status_code=404, detail="job vanished from registry")
+        jr["status"] = "error"
+        jr["error"] = reason[:300]
+        jr["completed_at"] = _now()
+        _persist(jr)
+    log.info("job %s depth rejected: %s", job_id, reason[:200])
+    _notify_job_done(job_id)
+    return {"job_id": job_id, "status": "error", "note": "rejected", "reason": reason}
 
 
 @app.get("/features/{project}/{feature}", dependencies=[Depends(require_bearer)])

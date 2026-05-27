@@ -897,6 +897,7 @@ def _run_review_pipeline(
     test_results_by_repo: dict | None = None,
     progress_cb=None,
     tests_future: Future | None = None,
+    caller_context_md: str = "",
 ) -> dict:
     """Two-phase review pipeline shared by the CLI and the HTTP server.
 
@@ -906,6 +907,12 @@ def _run_review_pipeline(
     review phase no longer waits on tests. When set, `test_results_by_repo`
     is ignored and reviewers don't see test results during the initial pass;
     the reconcile prompt picks them up instead.
+
+    `caller_context_md`, if non-empty, is the symbol-graph-derived
+    "Potentially impacted callers" section (task #10). It's injected between
+    the diff and the task instructions in the phase-1 prompt only —
+    reconcile reviewers don't need to re-discover callers, they're focused
+    on resolving disagreements about findings already raised.
     """
     cb = progress_cb if callable(progress_cb) else (lambda _m: None)
     context_block = f"# Context\n{extra_context}\n\n" if extra_context else ""
@@ -913,6 +920,10 @@ def _run_review_pipeline(
     prior_block = _build_prior_iteration_section(prior_result)
     if prior_block:
         prior_block = prior_block + "\n\n"
+
+    # Caller-context: lives in its own section between the diff and the task
+    # instructions. Trailing blank line keeps the prompt visually clean.
+    caller_block = f"{caller_context_md.rstrip()}\n\n" if caller_context_md else ""
 
     # Tests-in-parallel mode: defer the test block until reconcile so the
     # initial reviews can start immediately without waiting for `next build`.
@@ -930,6 +941,7 @@ def _run_review_pipeline(
         f"{test_block}"
         f"# Code under review ({label})\n\n"
         f"{payload}\n\n"
+        f"{caller_block}"
         f"# Your task\n"
         f"Produce your structured review of the code above. You are reviewing INDEPENDENTLY — "
         f"you have not seen any other reviewer's notes. Be specific and concrete."
@@ -950,6 +962,17 @@ def _run_review_pipeline(
             "suite passes on this branch. Failing tests are a hard finding — call them out "
             "even if the rest of the diff looks fine."
             if test_block else ""
+        )
+        + (
+            " The 'Potentially impacted callers' section lists places elsewhere in the "
+            "codebase that call symbols changed in the diff (mechanically extracted via "
+            "a symbol graph). Use it to verify the diff doesn't break callers you wouldn't "
+            "otherwise see. Direct callers deserve high scrutiny; indirect callers may or "
+            "may not be affected depending on whether the intermediate function fully "
+            "encapsulates the changed contract — verify case-by-case. If you can't tell "
+            "from the snippet, flag it as a finding asking the implementer to verify "
+            "manually rather than silently approving."
+            if caller_block else ""
         )
         + "\n\n# Machine-readable findings\n"
         "After your markdown review, append a fenced ```json code block — and NOTHING "
@@ -1239,17 +1262,27 @@ def _branch_payload(
     only_globs: list[str],
     include_all: bool,
     summary_only: bool,
-) -> tuple[str, str, dict, int]:
+) -> tuple[str, str, dict, str]:
     """Build the payload for a single (repo, branch, base) triple.
 
-    Returns (short_label, payload_markdown, fstats, raw_diff_chars).
+    Returns (short_label, payload_markdown, fstats, raw_diff_text).
+    The raw diff text is what feeds into caller-context analysis
+    (caller_lookup.build_caller_context) — empty string in summary_only
+    mode where we deliberately don't compute a line-level diff.
     Caller is responsible for the size cap when combining multiple repos.
     """
     label, payload = load_code_input(
         None, None, branch, base, repo,
         only_globs=only_globs, include_all=include_all, summary_only=summary_only,
     )
-    return label, payload, {}, len(payload)
+    # The raw diff is what caller-context analysis needs. Recompute via git
+    # (it's cached after load_code_input's earlier call — submillisecond).
+    raw_diff = ""
+    if not summary_only:
+        r = _git(repo, "diff", f"{base}...{branch}")
+        if r.returncode == 0:
+            raw_diff = r.stdout
+    return label, payload, {}, raw_diff
 
 
 def review_multi_repo_structured(
@@ -1265,11 +1298,16 @@ def review_multi_repo_structured(
     progress_cb=None,
     feature: str | None = None,
     tests_future: Future | None = None,
+    caller_depth: int = 1,
 ) -> dict:
     """Run a single review whose subject is changes across multiple repos.
 
     Each entry in `repos` is {repo: <local path>, repo_url: <url>, branch: <name>,
     base: <name>}. The server is responsible for cloning/fetching before calling.
+
+    `caller_depth` controls the symbol-graph caller-context analysis
+    (task #10): 1 = direct callers only, 2 = one hop of indirect callers
+    tagged separately. Depth>1 is gated by the server-side approval flow.
     """
     if not repos:
         raise RuntimeError("repos must be non-empty")
@@ -1279,6 +1317,8 @@ def review_multi_repo_structured(
         raise RuntimeError("prompts/review.md must contain '### CLAUDE' and '### CODEX' sections")
 
     sections: list[str] = []
+    caller_context_sections: list[str] = []
+    caller_context_meta: list[dict] = []
     handoff_source: str | None = None
     handoff_content: str | None = None
     repo_labels: list[str] = []
@@ -1290,7 +1330,7 @@ def review_multi_repo_structured(
         repo_id = r.get("repo_url") or repo_path
         info(f"loading repo {i}/{len(repos)}: {repo_id} ({branch} vs {base})")
 
-        sub_label, sub_payload, _, _ = _branch_payload(
+        sub_label, sub_payload, _, raw_diff = _branch_payload(
             repo=repo_path, branch=branch, base=base,
             only_globs=only_globs or [], include_all=include_all,
             summary_only=summary_only,
@@ -1301,6 +1341,27 @@ def review_multi_repo_structured(
             f"_({sub_label})_\n\n"
             f"{sub_payload}"
         )
+
+        # Per-repo caller-context. Skip on summary-only (no diff to analyze)
+        # and silently swallow any failures — caller-context is a best-effort
+        # enhancement, never a blocker.
+        if raw_diff and not summary_only:
+            try:
+                from caller_lookup import build_caller_context
+                cc = build_caller_context(repo_path, raw_diff, depth=caller_depth)
+                if cc.get("section_md"):
+                    caller_context_sections.append(
+                        f"### Caller context for `{repo_id}`\n\n{cc['section_md']}"
+                    )
+                caller_context_meta.append({"repo": repo_id, **{
+                    k: cc[k] for k in (
+                        "depth_used", "changed_symbols", "callers_found",
+                        "callers_included", "callers_truncated", "bytes", "note"
+                    )
+                }})
+                info(f"  caller-context: {cc['note']}")
+            except Exception as e:
+                info(f"  caller-context skipped: {type(e).__name__}: {e}")
 
         # First handoff found wins.
         if handoff_content is None:
@@ -1334,6 +1395,12 @@ def review_multi_repo_structured(
     )
     extra_context = "\n\n---\n\n".join(parts).strip()
 
+    caller_context_md = "\n\n---\n\n".join(caller_context_sections).strip()
+    if caller_context_md:
+        info(f"caller-context total: {sum(m['callers_included'] for m in caller_context_meta)} "
+             f"caller(s) across {len(caller_context_meta)} repo(s), "
+             f"{len(caller_context_md):,} chars")
+
     info(f"mode=review (multi-repo)  total payload {len(combined_payload):,} chars")
     if prior_result:
         info("prior iteration context present — re-review mode")
@@ -1344,12 +1411,21 @@ def review_multi_repo_structured(
         roles, label, combined_payload, extra_context,
         prior_result=prior_result, test_results_by_repo=test_results_by_repo,
         progress_cb=progress_cb, tests_future=tests_future,
+        caller_context_md=caller_context_md,
     )
     result["handoff_source"] = handoff_source
     # Persist the full handoff text so the UI can render it on the detail
     # page (collapsible "Submission" card). Stripped from the lean API
     # response — only the dashboard's ?full=true fetch needs it.
     result["handoff_content"] = handoff_content
+    # Caller-context summary (task #10) — per-repo metadata + aggregate.
+    result["caller_context"] = {
+        "depth_used": caller_depth,
+        "per_repo": caller_context_meta,
+        "section_md": caller_context_md,
+        "total_callers_included": sum(m["callers_included"] for m in caller_context_meta),
+        "total_bytes": len(caller_context_md),
+    }
     result["request"] = {
         "repos": [
             {"repo_url": r.get("repo_url"), "branch": r["branch"], "base": r["base"]}
@@ -1358,6 +1434,7 @@ def review_multi_repo_structured(
         "only_globs": only_globs or [],
         "include_all": include_all,
         "summary_only": summary_only,
+        "caller_depth": caller_depth,
     }
     return result
 
@@ -1377,11 +1454,15 @@ def review_branch_structured(
     progress_cb=None,
     feature: str | None = None,
     tests_future: Future | None = None,
+    caller_depth: int = 1,
 ) -> dict:
     """Server-friendly entrypoint. Runs a branch review and returns a structured result.
 
     Raises RuntimeError on validation/load failures (instead of sys.exit). The HTTP
     server catches these and reports them on the job record.
+
+    `caller_depth` controls the symbol-graph caller-context analysis
+    (task #10): 1 = direct callers only, 2 = one-hop indirect.
     """
     roles = load_roles("review")
     if "claude" not in roles or "codex" not in roles:
@@ -1407,12 +1488,41 @@ def review_branch_structured(
         parts.append(f"## Inline note\n\n{context.strip()}")
     extra_context = "\n\n---\n\n".join(parts).strip()
 
+    # Caller-context analysis (task #10). Best-effort; never blocks the review.
+    caller_context_md = ""
+    caller_context_meta: dict = {
+        "depth_used": caller_depth, "per_repo": [], "section_md": "",
+        "total_callers_included": 0, "total_bytes": 0,
+    }
+    if not summary_only:
+        try:
+            r = _git(repo, "diff", f"{base}...{branch}")
+            if r.returncode == 0 and r.stdout:
+                from caller_lookup import build_caller_context
+                cc = build_caller_context(repo, r.stdout, depth=caller_depth)
+                if cc.get("section_md"):
+                    caller_context_md = cc["section_md"]
+                caller_context_meta["per_repo"].append({"repo": repo, **{
+                    k: cc[k] for k in (
+                        "depth_used", "changed_symbols", "callers_found",
+                        "callers_included", "callers_truncated", "bytes", "note"
+                    )
+                }})
+                caller_context_meta["section_md"] = caller_context_md
+                caller_context_meta["total_callers_included"] = cc.get("callers_included", 0)
+                caller_context_meta["total_bytes"] = len(caller_context_md)
+                info(f"caller-context: {cc['note']}")
+        except Exception as e:
+            info(f"caller-context skipped: {type(e).__name__}: {e}")
+
     info(f"mode=review (server)  subject={label}  size={len(payload)} chars")
     result = _run_review_pipeline(
         roles, label, payload, extra_context,
         prior_result=prior_result, test_results_by_repo=test_results_by_repo,
         progress_cb=progress_cb, tests_future=tests_future,
+        caller_context_md=caller_context_md,
     )
+    result["caller_context"] = caller_context_meta
     result["handoff_source"] = handoff_source
     result["handoff_content"] = handoff_content
     result["request"] = {
@@ -1424,6 +1534,7 @@ def review_branch_structured(
         "summary_only": summary_only,
         "handoff_path": handoff_path,
         "no_handoff": no_handoff,
+        "caller_depth": caller_depth,
     }
     return result
 
