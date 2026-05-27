@@ -592,8 +592,21 @@ def load_code_input(
     only_globs: list[str] | None = None,
     include_all: bool = False,
     summary_only: bool = False,
+    since_commit: str | None = None,
+    narrow_to_recent_commits: bool = False,
 ) -> tuple[str, str]:
-    """Return (label, content) for the review subject."""
+    """Return (label, content) for the review subject.
+
+    Task #9 — commit-range review:
+    - `since_commit` is the anchor SHA for "review only commits since X".
+      Always recorded in the payload as context (so reviewers know iter-N's
+      cut point).
+    - `narrow_to_recent_commits` is the opt-in flag that ACTUALLY changes
+      the diff range from `<base>...<branch>` (full feature) to
+      `<since>..<branch>` (only the new commits). When false (default),
+      the diff stays full and `since_commit` is used only for the
+      annotation header.
+    """
     if file_path:
         p = pathlib.Path(file_path)
         if not p.exists():
@@ -608,19 +621,60 @@ def load_code_input(
             if r.returncode != 0:
                 sys.exit(f"git ref not found: {ref}\n{r.stderr.strip()}")
 
-        log = _git(repo, "log", "--pretty=format:%h %s", f"{base}..{branch}")
+        # Validate since_commit if given — must be reachable from branch.
+        if since_commit:
+            r = _git(repo, "rev-parse", "--verify", since_commit)
+            if r.returncode != 0:
+                sys.exit(
+                    f"since_commit not found: {since_commit}\n{r.stderr.strip()}"
+                )
+            # Must be an ancestor of branch (otherwise narrowing makes no sense)
+            r = _git(repo, "merge-base", "--is-ancestor", since_commit, branch)
+            if r.returncode != 0:
+                sys.exit(
+                    f"since_commit {since_commit} is not reachable from {branch}"
+                )
+
+        # Diff range. Task #9:
+        # - narrow=true → <since>..<branch> (only NEW commits)
+        # - narrow=false (default) → <base>...<branch> (full feature)
+        if narrow_to_recent_commits and since_commit:
+            diff_range_2dot = f"{since_commit}..{branch}"   # for diff + log
+            diff_range_3dot = f"{since_commit}..{branch}"   # for diff --stat
+            range_desc_narrow = True
+        else:
+            diff_range_2dot = f"{base}..{branch}"
+            diff_range_3dot = f"{base}...{branch}"
+            range_desc_narrow = False
+
+        log = _git(repo, "log", "--pretty=format:%h %s", diff_range_2dot)
         if log.returncode != 0:
             sys.exit(f"git log failed: {log.stderr.strip()}")
-        commits = log.stdout.strip() or "(no commits ahead of base)"
+        commits = log.stdout.strip() or "(no commits in range)"
 
-        stat = _git(repo, "diff", "--stat", f"{base}...{branch}")
+        # When narrow=false but since_commit IS set (stage-1 annotation),
+        # also list the new commits since the prior anchor — reviewers use
+        # this to focus their scrutiny.
+        new_commits_since_prior = ""
+        if since_commit and not range_desc_narrow:
+            r = _git(repo, "log", "--pretty=format:%h %s",
+                     f"{since_commit}..{branch}")
+            if r.returncode == 0:
+                new_commits_since_prior = r.stdout.strip()
+
+        stat = _git(repo, "diff", "--stat", diff_range_3dot)
         if stat.returncode != 0:
             sys.exit(f"git diff --stat failed: {stat.stderr.strip()}")
 
         if summary_only:
             label = f"branch {branch} vs {base} (summary)"
+            range_note = (
+                f"`{branch}` compared to base `{base}`"
+                if not range_desc_narrow
+                else f"`{branch}` NARROWED to commits since `{since_commit[:12]}`"
+            )
             payload = (
-                f"## Branch\n`{branch}` compared to base `{base}`\n\n"
+                f"## Branch\n{range_note}\n\n"
                 f"## Commits on this branch (oldest first)\n"
                 f"```\n{commits}\n```\n\n"
                 f"## File-level changes\n"
@@ -631,11 +685,11 @@ def load_code_input(
             )
             return (label, payload)
 
-        diff = _git(repo, "diff", f"{base}...{branch}")
+        diff = _git(repo, "diff", diff_range_3dot)
         if diff.returncode != 0:
             sys.exit(f"git diff failed: {diff.stderr.strip()}")
         if not diff.stdout.strip():
-            sys.exit(f"No changes between {base} and {branch} — nothing to review.")
+            sys.exit(f"No changes in range {diff_range_3dot} — nothing to review.")
 
         raw_chars = len(diff.stdout)
         # Per-repo additive exclusion list — committed by the coder AI to
@@ -689,12 +743,49 @@ def load_code_input(
         label = f"branch {branch} vs {base}" + (f" (repo: {repo})" if repo else "")
         if only_globs:
             label += f" — only: {', '.join(only_globs)}"
+        if range_desc_narrow:
+            label += f" — NARROWED to commits since {since_commit[:12]}"
+
+        # Branch section header reflects narrow vs full mode.
+        if range_desc_narrow:
+            branch_section = (
+                f"## Branch\n`{branch}` is on top of base `{base}`. "
+                f"**NARROWED REVIEW SCOPE:** the diff below covers only "
+                f"commits since `{since_commit[:12]}` (the prior review's "
+                f"reviewed SHA), NOT the full feature. Earlier commits in "
+                f"this feature branch are NOT visible in the diff. See the "
+                f"task-instructions section for the implications.\n\n"
+            )
+        else:
+            branch_section = f"## Branch\n`{branch}` compared to base `{base}`\n\n"
+
+        # Stage-1 annotation block: when since_commit is set but we're NOT
+        # narrowing, list the new commits since the prior review as a focus
+        # hint. The full diff is still shown; the reviewer just knows where
+        # to concentrate attention.
+        focus_block = ""
+        if since_commit and not range_desc_narrow and new_commits_since_prior:
+            focus_block = (
+                f"## Commits since prior review (focus here)\n\n"
+                f"Prior reviewed SHA: `{since_commit[:12]}` &nbsp;·&nbsp; "
+                f"Current HEAD: `{branch}`\n\n"
+                f"The full feature diff is shown below, but THESE are the "
+                f"commits added since the prior review approved at "
+                f"`{since_commit[:12]}`:\n\n"
+                f"```\n{new_commits_since_prior}\n```\n\n"
+                f"Concentrate scrutiny on these new commits. Earlier commits "
+                f"in the same feature branch were reviewed in the prior "
+                f"iteration — only re-flag them if a new commit changes "
+                f"something they depended on.\n\n"
+            )
+
         payload = (
-            f"## Branch\n`{branch}` compared to base `{base}`\n\n"
+            f"{branch_section}"
             f"## Commits on this branch (oldest first)\n"
             f"```\n{commits}\n```\n\n"
             f"## File-level changes\n"
             f"```\n{stat.stdout.strip()}\n```\n\n"
+            f"{focus_block}"
             f"## Diff (reviewing {fstats['kept_files']} of {fstats['total_files']} files)\n"
             f"```diff\n{filtered}\n```"
         )
@@ -925,6 +1016,12 @@ def _run_review_pipeline(
     # instructions. Trailing blank line keeps the prompt visually clean.
     caller_block = f"{caller_context_md.rstrip()}\n\n" if caller_context_md else ""
 
+    # Narrow-mode detection (task #9 stage 2). load_code_input puts a
+    # specific marker into the payload when the diff was narrowed to
+    # commits-since-prior. Detect from the marker rather than threading
+    # another parameter through — narrowing is a payload-shape thing.
+    narrow_mode_active = "NARROWED REVIEW SCOPE" in payload
+
     # Tests-in-parallel mode: defer the test block until reconcile so the
     # initial reviews can start immediately without waiting for `next build`.
     tests_deferred = tests_future is not None
@@ -973,6 +1070,18 @@ def _run_review_pipeline(
             "from the snippet, flag it as a finding asking the implementer to verify "
             "manually rather than silently approving."
             if caller_block else ""
+        )
+        + (
+            " The diff has been NARROWED to only the commits added since the prior "
+            "review iteration — earlier commits in the same feature branch are NOT in "
+            "the diff you see. You CANNOT detect cross-iteration regressions where a "
+            "new commit breaks code touched in an earlier commit (because the earlier "
+            "code isn't visible). If you spot any contract / interface / nullability / "
+            "exception-shape change in the new commits, raise a finding asking the "
+            "implementer to manually verify it against earlier-iter files that depended "
+            "on the old contract — don't silently approve. Findings within the visible "
+            "diff retain full scrutiny."
+            if narrow_mode_active else ""
         )
         + "\n\n# Machine-readable findings\n"
         "After your markdown review, append a fenced ```json code block — and NOTHING "
@@ -1262,6 +1371,8 @@ def _branch_payload(
     only_globs: list[str],
     include_all: bool,
     summary_only: bool,
+    since_commit: str | None = None,
+    narrow_to_recent_commits: bool = False,
 ) -> tuple[str, str, dict, str]:
     """Build the payload for a single (repo, branch, base) triple.
 
@@ -1270,16 +1381,25 @@ def _branch_payload(
     (caller_lookup.build_caller_context) — empty string in summary_only
     mode where we deliberately don't compute a line-level diff.
     Caller is responsible for the size cap when combining multiple repos.
+
+    Task #9 — when `narrow_to_recent_commits=True` AND `since_commit` is
+    set, the diff scope narrows from base...branch to since..branch.
     """
     label, payload = load_code_input(
         None, None, branch, base, repo,
         only_globs=only_globs, include_all=include_all, summary_only=summary_only,
+        since_commit=since_commit,
+        narrow_to_recent_commits=narrow_to_recent_commits,
     )
-    # The raw diff is what caller-context analysis needs. Recompute via git
-    # (it's cached after load_code_input's earlier call — submillisecond).
+    # Raw diff for caller-context analysis. Must use the SAME range as
+    # load_code_input so the symbol-graph analysis sees the same set of
+    # changed lines the reviewer sees.
     raw_diff = ""
     if not summary_only:
-        r = _git(repo, "diff", f"{base}...{branch}")
+        if narrow_to_recent_commits and since_commit:
+            r = _git(repo, "diff", f"{since_commit}..{branch}")
+        else:
+            r = _git(repo, "diff", f"{base}...{branch}")
         if r.returncode == 0:
             raw_diff = r.stdout
     return label, payload, {}, raw_diff
@@ -1299,6 +1419,9 @@ def review_multi_repo_structured(
     feature: str | None = None,
     tests_future: Future | None = None,
     caller_depth: int = 2,
+    prior_head_shas: dict | None = None,
+    since_commit: str | None = None,
+    narrow_to_recent_commits: bool = False,
 ) -> dict:
     """Run a single review whose subject is changes across multiple repos.
 
@@ -1323,6 +1446,11 @@ def review_multi_repo_structured(
     handoff_content: str | None = None
     repo_labels: list[str] = []
 
+    # Per-repo since_commit anchor: explicit override wins; otherwise
+    # auto-resolve from prior_head_shas (which the server filled from
+    # previous_job_id). Auto-anchor enables stage-1 annotation by default.
+    prior_head_shas = prior_head_shas or {}
+
     for i, r in enumerate(repos, start=1):
         repo_path = r["repo"]
         branch = r["branch"]
@@ -1330,10 +1458,20 @@ def review_multi_repo_structured(
         repo_id = r.get("repo_url") or repo_path
         info(f"loading repo {i}/{len(repos)}: {repo_id} ({branch} vs {base})")
 
+        # Per-repo since-anchor. Explicit since_commit only makes sense
+        # for single-repo submissions; for multi-repo it's ambiguous which
+        # repo it refers to, so we ignore it here and rely on auto-anchor
+        # via prior_head_shas (which has one SHA per repo).
+        per_repo_since = prior_head_shas.get(repo_id)
+        if per_repo_since:
+            info(f"  since anchor: {per_repo_since[:12]} (from prior iteration)")
+
         sub_label, sub_payload, _, raw_diff = _branch_payload(
             repo=repo_path, branch=branch, base=base,
             only_globs=only_globs or [], include_all=include_all,
             summary_only=summary_only,
+            since_commit=per_repo_since,
+            narrow_to_recent_commits=narrow_to_recent_commits and bool(per_repo_since),
         )
         repo_labels.append(repo_id)
         sections.append(
@@ -1426,6 +1564,25 @@ def review_multi_repo_structured(
         "total_callers_included": sum(m["callers_included"] for m in caller_context_meta),
         "total_bytes": len(caller_context_md),
     }
+    # Commit-range summary (task #9) — what range each repo was reviewed
+    # at. The UI uses this to surface "reviewed since SHA X" on the detail
+    # page; the AI consumers ignore it.
+    result["commit_range"] = {
+        "narrow_to_recent_commits": narrow_to_recent_commits,
+        "explicit_since_commit": since_commit,
+        "per_repo": [
+            {
+                "repo_url": r.get("repo_url"),
+                "branch": r["branch"],
+                "base": r["base"],
+                "since_anchor": prior_head_shas.get(r.get("repo_url")),
+                "narrowed": narrow_to_recent_commits and bool(
+                    prior_head_shas.get(r.get("repo_url"))
+                ),
+            }
+            for r in repos
+        ],
+    }
     result["request"] = {
         "repos": [
             {"repo_url": r.get("repo_url"), "branch": r["branch"], "base": r["base"]}
@@ -1435,6 +1592,8 @@ def review_multi_repo_structured(
         "include_all": include_all,
         "summary_only": summary_only,
         "caller_depth": caller_depth,
+        "since_commit": since_commit,
+        "narrow_to_recent_commits": narrow_to_recent_commits,
     }
     return result
 
@@ -1455,6 +1614,9 @@ def review_branch_structured(
     feature: str | None = None,
     tests_future: Future | None = None,
     caller_depth: int = 2,
+    prior_head_shas: dict | None = None,
+    since_commit: str | None = None,
+    narrow_to_recent_commits: bool = False,
 ) -> dict:
     """Server-friendly entrypoint. Runs a branch review and returns a structured result.
 
@@ -1468,11 +1630,21 @@ def review_branch_structured(
     if "claude" not in roles or "codex" not in roles:
         raise RuntimeError("prompts/review.md must contain '### CLAUDE' and '### CODEX' sections")
 
+    # Resolve since-anchor for stage-1 annotation / stage-2 narrowing
+    # (task #9). Explicit since_commit wins; otherwise look up the prior
+    # iteration's SHA (single-repo: this branch's repo_url isn't always
+    # known here, so fall back to first-value-in-dict heuristic).
+    effective_since = since_commit
+    if not effective_since and prior_head_shas:
+        effective_since = next(iter(prior_head_shas.values()), None)
+
     label, payload = load_code_input(
         None, None, branch, base, repo,
         only_globs=only_globs or [],
         include_all=include_all,
         summary_only=summary_only,
+        since_commit=effective_since,
+        narrow_to_recent_commits=narrow_to_recent_commits and bool(effective_since),
     )
 
     parts: list[str] = []
@@ -1496,7 +1668,12 @@ def review_branch_structured(
     }
     if not summary_only:
         try:
-            r = _git(repo, "diff", f"{base}...{branch}")
+            # Use the same diff range as load_code_input so caller-context
+            # analysis sees the same set of changed lines.
+            if narrow_to_recent_commits and effective_since:
+                r = _git(repo, "diff", f"{effective_since}..{branch}")
+            else:
+                r = _git(repo, "diff", f"{base}...{branch}")
             if r.returncode == 0 and r.stdout:
                 from caller_lookup import build_caller_context
                 cc = build_caller_context(repo, r.stdout, depth=caller_depth)
@@ -1525,6 +1702,17 @@ def review_branch_structured(
     result["caller_context"] = caller_context_meta
     result["handoff_source"] = handoff_source
     result["handoff_content"] = handoff_content
+    result["commit_range"] = {
+        "narrow_to_recent_commits": narrow_to_recent_commits,
+        "explicit_since_commit": since_commit,
+        "per_repo": [{
+            "repo_url": repo,
+            "branch": branch,
+            "base": base,
+            "since_anchor": effective_since,
+            "narrowed": narrow_to_recent_commits and bool(effective_since),
+        }],
+    }
     result["request"] = {
         "repo": repo,
         "branch": branch,
@@ -1535,6 +1723,8 @@ def review_branch_structured(
         "handoff_path": handoff_path,
         "no_handoff": no_handoff,
         "caller_depth": caller_depth,
+        "since_commit": since_commit,
+        "narrow_to_recent_commits": narrow_to_recent_commits,
     }
     return result
 

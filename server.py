@@ -393,6 +393,20 @@ class ReviewRequest(BaseModel):
     # depth>2 is ever added, but no current submission hits it.
     caller_depth: int = 2
 
+    # Commit-range review (task #9). Two related fields:
+    # - since_commit: explicit anchor for "diff me only from this SHA to
+    #   HEAD". Optional — when omitted but previous_job_id is set, the
+    #   server auto-resolves the prior job's recorded HEAD SHA as anchor
+    #   (for the annotation-only path).
+    # - narrow_to_recent_commits: when true, the diff scope ACTUALLY
+    #   narrows to <since_commit>..HEAD instead of the default
+    #   base...branch. This is the cost-aggressive path (10-20x reduction
+    #   on long-iter features) at the cost of ~3-8% catch-rate loss on
+    #   cross-iter regressions. When false (default), the diff stays full
+    #   and the since_commit is used only as the annotation anchor.
+    since_commit: Optional[str] = None
+    narrow_to_recent_commits: bool = False
+
     @field_validator("project", "feature")
     @classmethod
     def _check_label(cls, v: Optional[str]) -> Optional[str]:
@@ -431,6 +445,20 @@ class ReviewRequest(BaseModel):
         if n not in (1, 2):
             raise ValueError("caller_depth must be 1 or 2 (depth>2 is not supported)")
         return n
+
+    @field_validator("since_commit")
+    @classmethod
+    def _check_since_commit(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        v = v.strip()
+        if not v:
+            return None
+        # Accept 7+ hex chars (short SHA) up to 40 (full SHA). Reachability
+        # validation happens at review time when we have the repo handy.
+        if not re.fullmatch(r"[0-9a-fA-F]{7,40}", v):
+            raise ValueError("since_commit must be a git SHA (7-40 hex chars)")
+        return v.lower()
 
     def normalized_repos(self) -> list[RepoSpec]:
         """Always return a non-empty list of RepoSpec, validating the either/or shape."""
@@ -605,6 +633,40 @@ def _load_prior_result(job_id: str) -> Optional[dict]:
     return job.get("result")
 
 
+def _load_prior_head_shas(job_id: str) -> dict[str, str]:
+    """Return the {repo_url: head_sha} map from a prior complete job, or {}.
+    This is what auto-resolves the since-commit anchor for stage 1
+    annotations and stage 2 narrowing (task #9). Empty dict signals
+    "no anchor available" — review proceeds in normal full-branch mode."""
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+    if job is None:
+        job = _load_from_disk(job_id)
+    if job is None:
+        return {}
+    out = job.get("head_sha_by_repo")
+    return out if isinstance(out, dict) else {}
+
+
+def _resolve_head_shas(prepared: list[dict]) -> dict[str, str]:
+    """Resolve the current HEAD SHA of each prepared repo's branch.
+    Called right after `prepared` is built — every refs has been fetched
+    fresh by _ensure_repo, so origin/<branch> is up-to-date."""
+    out: dict[str, str] = {}
+    for p in prepared:
+        # `branch` is already prefixed with origin/ at this point (server.py
+        # adds the prefix before calling ai_chat).
+        r = subprocess.run(
+            ["git", "-C", p["repo"], "rev-parse", "--verify", p["branch"]],
+            capture_output=True, text=True,
+        )
+        if r.returncode == 0:
+            sha = r.stdout.strip()
+            if sha:
+                out[p["repo_url"]] = sha
+    return out
+
+
 def _ensure_repo(url: str) -> pathlib.Path:
     """Clone the repo on first use, otherwise fetch latest refs from origin."""
     target = _repo_dir_for(url)
@@ -662,13 +724,28 @@ def _run_job(job_id: str) -> None:
                 "base": f"origin/{r['base']}",
             })
 
-        # Prior iteration context (optional).
+        # Resolve and persist the HEAD SHA of each repo's reviewed branch.
+        # Future iterations with previous_job_id pointing here will use
+        # these SHAs as the since-commit anchor for the "Commits since
+        # prior review" annotation (and for opt-in stage-2 narrowing).
+        head_sha_by_repo = _resolve_head_shas(prepared)
+        _update(job_id, head_sha_by_repo=head_sha_by_repo)
+
+        # Prior iteration context (optional). When set, also fetch the
+        # prior job's recorded head SHAs so review_*_structured can build
+        # the "Commits since prior review" annotation.
         prior_result = None
+        prior_head_shas: dict[str, str] = {}
         if req.get("previous_job_id"):
             prior_result = _load_prior_result(req["previous_job_id"])
             if prior_result is None:
                 log.warning("previous_job_id %s did not resolve to a completed job; ignoring",
                             req["previous_job_id"])
+            prior_head_shas = _load_prior_head_shas(req["previous_job_id"])
+            if prior_head_shas:
+                log.info("prior iteration head SHAs: %s",
+                         ", ".join(f"{_short_repo(u)}={s[:7]}"
+                                   for u, s in prior_head_shas.items()))
 
         # Tests run on a background thread so the review pipeline can start
         # in parallel. Tests are still SEQUENTIAL across repos within the
@@ -722,6 +799,14 @@ def _run_job(job_id: str) -> None:
             # (depth + one hop of indirect callers tagged). Anything above
             # the default goes through the approval gate before this point.
             caller_depth=int(req.get("caller_depth", DEFAULT_CALLER_DEPTH)),
+            # Commit-range review (task #9). prior_head_shas is auto-
+            # resolved from previous_job_id (when set) and feeds the
+            # "Commits since prior review" annotation. since_commit
+            # explicit-override + narrow_to_recent_commits are stage 2 —
+            # the actual diff range narrows when narrow=true.
+            prior_head_shas=prior_head_shas,
+            since_commit=req.get("since_commit"),
+            narrow_to_recent_commits=bool(req.get("narrow_to_recent_commits", False)),
         )
 
         if len(prepared) == 1:

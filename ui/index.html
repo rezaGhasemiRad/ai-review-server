@@ -355,6 +355,23 @@ function renderSubmissionCard(j, r){
       warn: deeper,
     });
   }
+  // Commit-range flags (task #9). since_commit alone is annotation-mode
+  // (informational); narrow_to_recent_commits is the cost-aggressive path
+  // (warn-flagged because the reviewer is operating with reduced scope).
+  if(req.since_commit){
+    flagBits.push({
+      label:'since_commit='+req.since_commit.slice(0,12),
+      title:'Explicit anchor for "commits since X" annotation / narrowing.',
+      warn:false,
+    });
+  }
+  if(req.narrow_to_recent_commits){
+    flagBits.push({
+      label:'narrow_to_recent_commits',
+      title:'Diff scope narrowed to since..HEAD instead of base...branch. Cross-iteration regressions in earlier-iter files cannot be detected from the diff alone.',
+      warn:true,
+    });
+  }
   // If there's literally nothing meaningful to show, render nothing.
   if(!ctx && !handoffSrc && !handoffBody && !flagBits.length) return '';
 
@@ -733,6 +750,53 @@ async function loadDetail(){
         '<pre>'+esc(cc.section_md)+'</pre></details>';
     }
     h += '</div>';
+  }
+
+  // Commit-range / scope card (task #9). Surfaces what range was reviewed
+  // per repo, with explicit callout when narrow mode was active.
+  const cr = r.commit_range;
+  const headShas = j.head_sha_by_repo || {};
+  if(cr || Object.keys(headShas).length){
+    const perRepo = (cr && cr.per_repo) || [];
+    const anyNarrow = perRepo.some(p => p.narrowed);
+    const anyAnchor = perRepo.some(p => p.since_anchor);
+    if(perRepo.length && (anyAnchor || anyNarrow || Object.keys(headShas).length)){
+      h += '<div class="card"><h3 style="margin:0 0 10px">'+
+        'Reviewed range</h3>';
+      if(anyNarrow){
+        h += '<div style="padding:8px 10px;background:#fef3c7;border:1px solid #fbbf24;'+
+          'border-radius:5px;font-size:12px;margin-bottom:10px;color:#78350f">'+
+          '<b>Narrow scope:</b> diff covers only commits since the prior reviewed SHA, '+
+          'NOT the full feature branch. Reviewers were told to flag any contract change '+
+          'for manual cross-iteration verification.'+
+          '</div>';
+      }
+      h += '<table class="mono" style="font-size:12px;width:100%;border-collapse:collapse">'+
+        '<thead><tr style="text-align:left">'+
+        '<th style="padding:4px 8px">Repo</th>'+
+        '<th style="padding:4px 8px">Branch</th>'+
+        '<th style="padding:4px 8px">Base</th>'+
+        '<th style="padding:4px 8px">Since anchor</th>'+
+        '<th style="padding:4px 8px">Reviewed HEAD</th>'+
+        '<th style="padding:4px 8px">Scope</th>'+
+        '</tr></thead><tbody>';
+      h += perRepo.map(p => {
+        const repoShort = shortRepo(p.repo_url||'');
+        const head = headShas[p.repo_url] || '';
+        const since = p.since_anchor || '';
+        const scope = p.narrowed ? '<span style="color:#92400e">narrowed</span>'
+                                 : (since ? 'full + anchor' : 'full');
+        return '<tr style="border-top:1px solid var(--line)">'+
+          '<td style="padding:4px 8px">'+esc(repoShort)+'</td>'+
+          '<td style="padding:4px 8px">'+esc((p.branch||'').replace('origin/',''))+'</td>'+
+          '<td style="padding:4px 8px">'+esc((p.base||'').replace('origin/',''))+'</td>'+
+          '<td style="padding:4px 8px">'+(since ? esc(since.slice(0,12)) : '<span class="muted">—</span>')+'</td>'+
+          '<td style="padding:4px 8px">'+(head ? esc(head.slice(0,12)) : '<span class="muted">—</span>')+'</td>'+
+          '<td style="padding:4px 8px">'+scope+'</td>'+
+          '</tr>';
+      }).join('');
+      h += '</tbody></table></div>';
+    }
   }
 
   // feature timeline — only when tagged AND more than one iteration exists
