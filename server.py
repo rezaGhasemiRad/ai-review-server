@@ -978,6 +978,38 @@ def submit_review(req: ReviewRequest, request: Request) -> JobSubmitted:
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
+    # Fail loud when narrowing is requested but no anchor is resolvable
+    # (task #11). Narrowing needs a since-commit. It can come from an
+    # explicit since_commit OR be auto-resolved from previous_job_id's
+    # recorded head_sha_by_repo. If neither is available, the old behavior
+    # was to silently fall back to a full-diff review at full token cost —
+    # the coder AI thought it was narrowing but wasn't. Reject instead so
+    # the caller knows and can decide.
+    if req.narrow_to_recent_commits and not req.since_commit:
+        if not req.previous_job_id:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "narrow_to_recent_commits requires an anchor. Pass an "
+                    "explicit since_commit, or a previous_job_id whose "
+                    "head_sha_by_repo was recorded."
+                ),
+            )
+        prior_shas = _load_prior_head_shas(req.previous_job_id)
+        if not prior_shas:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"narrow_to_recent_commits requested but previous_job_id "
+                    f"'{req.previous_job_id}' has no recorded head_sha_by_repo "
+                    f"(it either errored before the SHA was captured, or ran "
+                    f"before head-SHA persistence was deployed). Options: "
+                    f"(1) remove narrow_to_recent_commits, (2) pass an explicit "
+                    f"since_commit, or (3) run one non-narrowed iteration first "
+                    f"to seed the anchor for future iterations."
+                ),
+            )
+
     # Resolve project/feature: explicit values win; otherwise inherit from
     # the prior job in an iteration chain.
     project, feature = req.project, req.feature

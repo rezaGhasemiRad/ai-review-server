@@ -760,7 +760,8 @@ async function loadDetail(){
     const perRepo = (cr && cr.per_repo) || [];
     const anyNarrow = perRepo.some(p => p.narrowed);
     const anyAnchor = perRepo.some(p => p.since_anchor);
-    if(perRepo.length && (anyAnchor || anyNarrow || Object.keys(headShas).length)){
+    const fallbackReason = cr && cr.narrow_fallback_reason;
+    if(perRepo.length && (anyAnchor || anyNarrow || fallbackReason || Object.keys(headShas).length)){
       h += '<div class="card"><h3 style="margin:0 0 10px">'+
         'Reviewed range</h3>';
       if(anyNarrow){
@@ -769,6 +770,15 @@ async function loadDetail(){
           '<b>Narrow scope:</b> diff covers only commits since the prior reviewed SHA, '+
           'NOT the full feature branch. Reviewers were told to flag any contract change '+
           'for manual cross-iteration verification.'+
+          '</div>';
+      }
+      // Task #11: narrow was requested but (some/all) repos fell back to
+      // full-diff because no anchor was available. Loud red callout so the
+      // human knows the requested narrowing did NOT happen for those repos.
+      if(fallbackReason){
+        h += '<div style="padding:8px 10px;background:#fee2e2;border:1px solid #fca5a5;'+
+          'border-radius:5px;font-size:12px;margin-bottom:10px;color:#991b1b">'+
+          '<b>Narrowing fell back to full diff:</b> '+esc(fallbackReason)+
           '</div>';
       }
       h += '<table class="mono" style="font-size:12px;width:100%;border-collapse:collapse">'+

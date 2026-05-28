@@ -1572,21 +1572,42 @@ def review_multi_repo_structured(
     # Commit-range summary (task #9) — what range each repo was reviewed
     # at. The UI uses this to surface "reviewed since SHA X" on the detail
     # page; the AI consumers ignore it.
+    cr_per_repo = [
+        {
+            "repo_url": r.get("repo_url"),
+            "branch": r["branch"],
+            "base": r["base"],
+            "since_anchor": prior_head_shas.get(r.get("repo_url")),
+            "narrowed": narrow_to_recent_commits and bool(
+                prior_head_shas.get(r.get("repo_url"))
+            ),
+            # Task #11: narrow was asked for, but THIS repo had no anchor
+            # (e.g. it was added to the feature after the prior iteration,
+            # so the prior job recorded no SHA for it). Surfaced so the
+            # human sees this repo silently fell back to full-diff.
+            "narrow_fallback": narrow_to_recent_commits and not bool(
+                prior_head_shas.get(r.get("repo_url"))
+            ),
+        }
+        for r in repos
+    ]
+    def _short(url: str) -> str:
+        name = (url or "").rstrip("/").rsplit("/", 1)[-1]
+        return name[:-4] if name.endswith(".git") else name
+    fallback_repos = [
+        _short(p["repo_url"]) for p in cr_per_repo if p["narrow_fallback"]
+    ]
     result["commit_range"] = {
         "narrow_to_recent_commits": narrow_to_recent_commits,
         "explicit_since_commit": since_commit,
-        "per_repo": [
-            {
-                "repo_url": r.get("repo_url"),
-                "branch": r["branch"],
-                "base": r["base"],
-                "since_anchor": prior_head_shas.get(r.get("repo_url")),
-                "narrowed": narrow_to_recent_commits and bool(
-                    prior_head_shas.get(r.get("repo_url"))
-                ),
-            }
-            for r in repos
-        ],
+        "per_repo": cr_per_repo,
+        "narrow_fallback_reason": (
+            f"narrow_to_recent_commits was requested, but {len(fallback_repos)} "
+            f"repo(s) had no since-anchor from the prior iteration and were "
+            f"reviewed at FULL diff scope: {', '.join(fallback_repos)}. "
+            f"(They were likely added to the feature after the prior review.)"
+            if fallback_repos else None
+        ),
     }
     result["request"] = {
         "repos": [
@@ -1711,6 +1732,7 @@ def review_branch_structured(
     result["caller_context"] = caller_context_meta
     result["handoff_source"] = handoff_source
     result["handoff_content"] = handoff_content
+    _single_fallback = narrow_to_recent_commits and not bool(effective_since)
     result["commit_range"] = {
         "narrow_to_recent_commits": narrow_to_recent_commits,
         "explicit_since_commit": since_commit,
@@ -1720,7 +1742,14 @@ def review_branch_structured(
             "base": base,
             "since_anchor": effective_since,
             "narrowed": narrow_to_recent_commits and bool(effective_since),
+            "narrow_fallback": _single_fallback,
         }],
+        "narrow_fallback_reason": (
+            "narrow_to_recent_commits was requested but no since-anchor was "
+            "resolvable (no explicit since_commit and no prior-iteration SHA). "
+            "Reviewed at FULL diff scope."
+            if _single_fallback else None
+        ),
     }
     result["request"] = {
         "repo": repo,
