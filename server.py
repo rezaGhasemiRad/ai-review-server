@@ -244,6 +244,17 @@ def _notify_job_done(job_id: str) -> None:
                 f"({w['rolling_5h_job_count']} review(s), "
                 f"{w['plan_label']}, excludes other Claude usage)\n"
             )
+        # Task #12: surface test skips so the wall-time saving is visible.
+        tr_all = result.get("test_results") or {}
+        skipped_nri = [
+            k for k, v in tr_all.items()
+            if isinstance(v, dict) and v.get("skipped_no_runtime_impact")
+        ]
+        if skipped_nri and tr_all:
+            body += (
+                f"Tests: {len(skipped_nri)}/{len(tr_all)} repo(s) skipped "
+                f"(no runtime impact)\n"
+            )
     else:
         err = (job.get("error") or "").strip()
         body = f"Review FAILED — {pf}\nError: {err[:300]}\n"
@@ -622,6 +633,113 @@ def _run_repo_tests(repo_path: str, ref: str, timeout_s: int) -> dict:
         )
 
 
+# --------------------------------------------------------------------------- #
+# Task #12 — skip Tier-1 tests on repos whose diff has no runtime impact.
+# --------------------------------------------------------------------------- #
+
+_TEST_IRRELEVANT_SUFFIXES = (".md", ".markdown", ".txt", ".rst")
+_TEST_IRRELEVANT_NAMES = (".gitignore", ".gitattributes", ".editorconfig")
+_TEST_IRRELEVANT_BASENAME_PREFIXES = ("README", "CHANGELOG", "LICENSE", "CONTRIBUTING")
+
+
+def _path_is_test_irrelevant(path: str) -> bool:
+    """True for files whose changes can't affect test outcomes — docs,
+    markdown, license/readme, .ai-collab metadata, editor config."""
+    p = path.replace("\\", "/")
+    if p.startswith(".ai-collab/") or "/.ai-collab/" in p:
+        return True
+    base = p.rsplit("/", 1)[-1]
+    if base in _TEST_IRRELEVANT_NAMES:
+        return True
+    low = base.lower()
+    if any(low.endswith(s) for s in _TEST_IRRELEVANT_SUFFIXES):
+        return True
+    up = base.upper()
+    if any(up.startswith(x) for x in _TEST_IRRELEVANT_BASENAME_PREFIXES):
+        return True
+    return False
+
+
+def _repo_runtime_change_check(repo_path: str, range_spec: str) -> tuple[bool, str]:
+    """Return (has_runtime_changes, reason).
+
+    Uses `git diff -w --numstat <range>`. The -w flag ignores in-line
+    whitespace, and crucially `--numstat` reports 0/0 (and thus omits
+    entirely) files whose ONLY change nets to whitespace — including
+    trailing-newline-at-EOF fixes, which `--name-only` would wrongly keep
+    (git treats the EOF newline as content for name-only but numstat
+    correctly nets it to zero under -w). Files surviving that are then
+    filtered against the docs/config allowlist. If nothing runtime-relevant
+    remains, tests can be safely skipped. Any git error → (True, "") so
+    tests run (fail safe).
+    """
+    r = subprocess.run(
+        ["git", "-C", repo_path, "diff", "-w", "--numstat", range_spec],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        return True, ""
+    changed: list[str] = []
+    for line in r.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 3:
+            continue
+        added, removed, path = parts
+        # Binary files report "-\t-" — can't reason about them, treat as a
+        # real change so tests run.
+        if added == "-" or removed == "-":
+            changed.append(path)
+            continue
+        try:
+            if int(added) > 0 or int(removed) > 0:
+                changed.append(path)
+        except ValueError:
+            changed.append(path)  # unparseable → be safe
+    if not changed:
+        return False, "no non-whitespace line changes"
+    runtime = [f for f in changed if not _path_is_test_irrelevant(f)]
+    if not runtime:
+        return False, f"only docs/config/whitespace changed ({len(changed)} file(s))"
+    return True, ""
+
+
+def _compute_test_skips(
+    prepared: list[dict],
+    prior_head_shas: dict[str, str],
+    prior_result: Optional[dict],
+) -> dict[str, str]:
+    """Per-repo decision: can Tier-1 tests be skipped? Returns
+    {repo_url: skip_reason} for repos that can skip; absent = run tests.
+
+    Safe to skip when EITHER:
+      (a) there's a prior PASSING test run for this repo AND nothing
+          runtime-relevant changed since that SHA (anchor..branch), OR
+      (b) the whole feature (base...branch) has no runtime-relevant change.
+    Anything uncertain → not in the dict → tests run.
+    """
+    out: dict[str, str] = {}
+    prior_tests = (prior_result or {}).get("test_results", {}) if prior_result else {}
+    for p in prepared:
+        repo_url = p["repo_url"]
+        anchor = prior_head_shas.get(repo_url)
+        prior_ok = (prior_tests.get(repo_url) or {}).get("status") == "passed"
+        # (a) Incremental: nothing runtime changed since a prior passing run.
+        if anchor and prior_ok:
+            has_rt, reason = _repo_runtime_change_check(
+                p["repo"], f"{anchor}..{p['branch']}"
+            )
+            if not has_rt:
+                out[repo_url] = f"{reason} since prior passing test run ({anchor[:12]})"
+                continue
+        # (b) Whole-feature: the entire base..branch contribution is non-runtime.
+        has_rt, reason = _repo_runtime_change_check(
+            p["repo"], f"{p['base']}...{p['branch']}"
+        )
+        if not has_rt:
+            out[repo_url] = f"{reason} (whole feature vs base)"
+    return out
+
+
 def _load_prior_result(job_id: str) -> Optional[dict]:
     """Return the `result` field of a prior complete job, or None."""
     with JOBS_LOCK:
@@ -757,19 +875,38 @@ def _run_job(job_id: str) -> None:
         tests_future: Future | None = None
         if req.get("run_tests", True):
             timeout_s = int(req.get("test_timeout_s") or 600)
+            # Task #12: decide which repos can skip tests (no runtime impact).
+            test_skip_by_repo = _compute_test_skips(prepared, prior_head_shas, prior_result)
+            if test_skip_by_repo:
+                log.info("test-skip: %d/%d repo(s) — %s",
+                         len(test_skip_by_repo), len(prepared),
+                         "; ".join(f"{_short_repo(u)}: {r}"
+                                   for u, r in test_skip_by_repo.items()))
             log.info("running tests in BACKGROUND across %d repo(s), "
                      "sequential within thread, timeout=%ds each",
-                     len(prepared), timeout_s)
+                     len(prepared) - len(test_skip_by_repo), timeout_s)
 
             def _run_tests_bg() -> dict:
                 results: dict = {}
                 for i, p in enumerate(prepared, 1):
-                    short = _short_repo(p["repo_url"])
+                    repo_url = p["repo_url"]
+                    short = _short_repo(repo_url)
+                    skip_reason = test_skip_by_repo.get(repo_url)
+                    if skip_reason:
+                        results[repo_url] = {
+                            "status": "skipped",
+                            "reason": f"tests skipped — {skip_reason}",
+                            "skipped_no_runtime_impact": True,
+                        }
+                        log.info("test SKIP %s: %s", repo_url, skip_reason)
+                        progress(f"Tier-1 tests ({i}/{len(prepared)}): "
+                                 f"{short} skipped (no runtime impact)")
+                        continue
                     progress(f"Tier-1 tests ({i}/{len(prepared)}): {short}")
                     tr = _run_repo_tests(p["repo"], p["branch"], timeout_s)
-                    results[p["repo_url"]] = tr
+                    results[repo_url] = tr
                     log.info("test result %s: status=%s exit=%s dur=%ss",
-                             p["repo_url"], tr.get("status"), tr.get("exit_code"),
+                             repo_url, tr.get("status"), tr.get("exit_code"),
                              tr.get("duration_s"))
                 # Stash on enclosing-scope dict too, so the outer code can
                 # read results for persistence even on the happy path.
