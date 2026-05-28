@@ -46,6 +46,7 @@ from caller_graph import (
     EXT_TO_LANG,
     _git_show_bytes,
     _is_noise,
+    build_graph,
     find_defs,
     find_refs,
     get_or_build_graph,
@@ -448,6 +449,7 @@ def build_caller_context(
     max_bytes: int = 30_000,
     skip_tests: bool = True,
     skip_if_small_diff: bool = True,
+    graph_ref: Optional[str] = None,
 ) -> dict:
     """Build the "Potentially impacted callers" markdown section for a diff.
 
@@ -459,7 +461,7 @@ def build_caller_context(
         repo_path: absolute path to the local clone the graph was built for.
         diff_text: unified diff text (e.g. output of git diff base...branch).
         ref: graph ref to read source from for snippet extraction. If None,
-            uses the ref the graph was built at (graph["ref"]).
+            falls back to graph_ref, then the graph's own ref, then HEAD.
         depth: 1 (direct callers only) or 2 (one hop of indirect callers).
         max_callers: hard cap on number of callers in the section.
         max_bytes: hard cap on the section's total markdown size in chars.
@@ -467,6 +469,22 @@ def build_caller_context(
         skip_if_small_diff: if the diff is <500 lines and no def appears
             to have a signature change, skip caller-context entirely
             (heuristic: tiny isolated bug fixes don't need it).
+        graph_ref: the FEATURE-BRANCH ref the diff was computed against
+            (e.g. "origin/feat/foo"). When set, the graph is built FRESH
+            from this ref instead of using the cached origin/main graph.
+
+            WHY THIS MATTERS: the diff's hunk line numbers are in the
+            feature-branch frame. The cached graph is built from origin/main.
+            When the feature branch has shifted lines (added/removed code
+            above a def in earlier commits), the cached graph's def line
+            ranges no longer align with the diff hunks → false negatives on
+            overlap → the graph silently reports "no changed symbols" for a
+            def that IS being modified. Building from graph_ref puts the
+            graph's def line numbers in the SAME frame as the diff hunks.
+
+            Not cached on disk — feature-branch graphs would pollute the
+            shared per-repo origin/main cache. Built fresh each review
+            (~1-3s per repo, invisible against the multi-minute review).
     """
     repo = pathlib.Path(repo_path).resolve()
     depth = max(1, min(2, int(depth or 1)))
@@ -489,8 +507,15 @@ def build_caller_context(
         # the iter-N cases where it matters most.
         pass
 
-    graph = get_or_build_graph(repo)
-    ref_for_snippet = ref or graph.get("ref") or "HEAD"
+    if graph_ref:
+        # Build a fresh graph at the feature-branch ref so def line numbers
+        # match the diff's hunk line numbers (see docstring). Not cached.
+        graph = build_graph(repo, graph_ref)
+        ref_for_snippet = ref or graph_ref
+    else:
+        # CLI / backward-compat path: use the cached origin/main graph.
+        graph = get_or_build_graph(repo)
+        ref_for_snippet = ref or graph.get("ref") or "HEAD"
 
     changed_defs = _find_changed_defs(graph, diff_paths)
     if not changed_defs:

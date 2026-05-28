@@ -1486,7 +1486,12 @@ def review_multi_repo_structured(
         if raw_diff and not summary_only:
             try:
                 from caller_lookup import build_caller_context
-                cc = build_caller_context(repo_path, raw_diff, depth=caller_depth)
+                # graph_ref=branch builds the symbol graph from the feature
+                # branch so def line numbers align with the diff hunk lines
+                # (option A — avoids origin/main line-drift false negatives).
+                cc = build_caller_context(
+                    repo_path, raw_diff, depth=caller_depth, graph_ref=branch,
+                )
                 if cc.get("section_md"):
                     caller_context_sections.append(
                         f"### Caller context for `{repo_id}`\n\n{cc['section_md']}"
@@ -1676,7 +1681,11 @@ def review_branch_structured(
                 r = _git(repo, "diff", f"{base}...{branch}")
             if r.returncode == 0 and r.stdout:
                 from caller_lookup import build_caller_context
-                cc = build_caller_context(repo, r.stdout, depth=caller_depth)
+                # graph_ref=branch — build the graph from the feature branch
+                # so def line numbers match the diff hunks (option A).
+                cc = build_caller_context(
+                    repo, r.stdout, depth=caller_depth, graph_ref=branch,
+                )
                 if cc.get("section_md"):
                     caller_context_md = cc["section_md"]
                 caller_context_meta["per_repo"].append({"repo": repo, **{
