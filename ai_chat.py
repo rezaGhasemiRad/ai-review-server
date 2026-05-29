@@ -583,6 +583,49 @@ def _normalize_peer_entries(entries: list) -> list:
     return out
 
 
+def _resolve_diff_range(
+    branch: str,
+    base: str,
+    since_commit: str | None,
+    to_commit: str | None,
+    narrow_to_recent_commits: bool,
+) -> dict:
+    """Resolve which commit range a review covers. Pure (no git calls) so
+    load_code_input AND the caller-context paths can share one source of
+    truth for the range.
+
+    Returns {diff, log, end, kind}:
+      - diff: the `git diff` argument for the line-level diff (and the
+        caller-context analysis — they MUST match so the symbol graph sees
+        the same changed lines the reviewer sees).
+      - log:  the `git log` 2-dot range for the commit listing.
+      - end:  the commit whose line frame the diff is in — used as the
+        symbol-graph build ref (task #10's graph_ref fix).
+      - kind: explicit_range | feature_up_to | narrow | full.
+
+    Modes (task #9 + #13):
+      explicit_range : since..to     — review commits A..B (exclude A, 2-dot)
+      feature_up_to  : base...to     — feature as of commit B (3-dot)
+      narrow         : since..branch — commits since prior review (2-dot)
+      full           : base...branch — whole feature (3-dot, default)
+    """
+    if since_commit and to_commit:
+        return {"diff": f"{since_commit}..{to_commit}",
+                "log": f"{since_commit}..{to_commit}",
+                "end": to_commit, "kind": "explicit_range"}
+    if to_commit:
+        return {"diff": f"{base}...{to_commit}",
+                "log": f"{base}..{to_commit}",
+                "end": to_commit, "kind": "feature_up_to"}
+    if narrow_to_recent_commits and since_commit:
+        return {"diff": f"{since_commit}..{branch}",
+                "log": f"{since_commit}..{branch}",
+                "end": branch, "kind": "narrow"}
+    return {"diff": f"{base}...{branch}",
+            "log": f"{base}..{branch}",
+            "end": branch, "kind": "full"}
+
+
 def load_code_input(
     file_path: str | None,
     diff_ref: str | None,
@@ -593,6 +636,7 @@ def load_code_input(
     include_all: bool = False,
     summary_only: bool = False,
     since_commit: str | None = None,
+    to_commit: str | None = None,
     narrow_to_recent_commits: bool = False,
 ) -> tuple[str, str]:
     """Return (label, content) for the review subject.
@@ -621,42 +665,51 @@ def load_code_input(
             if r.returncode != 0:
                 sys.exit(f"git ref not found: {ref}\n{r.stderr.strip()}")
 
-        # Validate since_commit if given — must be reachable from branch.
+        # Validate since_commit / to_commit if given.
+        def _verify_commit(c: str, what: str) -> None:
+            rr = _git(repo, "rev-parse", "--verify", c)
+            if rr.returncode != 0:
+                sys.exit(f"{what} not found: {c}\n{rr.stderr.strip()}")
+
+        if to_commit:
+            _verify_commit(to_commit, "to_commit")
+            # to_commit must be on the branch's history ("in a branch").
+            rr = _git(repo, "merge-base", "--is-ancestor", to_commit, branch)
+            if rr.returncode != 0:
+                sys.exit(f"to_commit {to_commit} is not reachable from {branch}")
+        # Effective end of the review range (to_commit caps it; else branch).
+        _range_end_for_validation = to_commit or branch
         if since_commit:
-            r = _git(repo, "rev-parse", "--verify", since_commit)
-            if r.returncode != 0:
-                sys.exit(
-                    f"since_commit not found: {since_commit}\n{r.stderr.strip()}"
-                )
-            # Must be an ancestor of branch (otherwise narrowing makes no sense)
-            r = _git(repo, "merge-base", "--is-ancestor", since_commit, branch)
-            if r.returncode != 0:
-                sys.exit(
-                    f"since_commit {since_commit} is not reachable from {branch}"
-                )
+            _verify_commit(since_commit, "since_commit")
+            # since must be an ancestor of the range end, else A..B is nonsense.
+            rr = _git(repo, "merge-base", "--is-ancestor",
+                      since_commit, _range_end_for_validation)
+            if rr.returncode != 0:
+                tgt = f"to_commit {to_commit}" if to_commit else branch
+                sys.exit(f"since_commit {since_commit} is not an ancestor of {tgt}")
 
-        # Diff range. Task #9:
-        # - narrow=true → <since>..<branch> (only NEW commits)
-        # - narrow=false (default) → <base>...<branch> (full feature)
-        if narrow_to_recent_commits and since_commit:
-            diff_range_2dot = f"{since_commit}..{branch}"   # for diff + log
-            diff_range_3dot = f"{since_commit}..{branch}"   # for diff --stat
-            range_desc_narrow = True
-        else:
-            diff_range_2dot = f"{base}..{branch}"
-            diff_range_3dot = f"{base}...{branch}"
-            range_desc_narrow = False
+        # Resolve the diff range (task #9 since_commit + task #13 to_commit).
+        _rng = _resolve_diff_range(
+            branch, base, since_commit, to_commit, narrow_to_recent_commits
+        )
+        diff_range_3dot = _rng["diff"]   # the actual diff (and --stat) range
+        range_kind = _rng["kind"]
+        # explicit_range and narrow are SUB-RANGES of the branch — code
+        # outside the range isn't visible, so the reviewer needs the
+        # cross-range warning. feature_up_to and full start from base, so
+        # nothing earlier is hidden.
+        range_desc_narrow = range_kind in ("explicit_range", "narrow")
 
-        log = _git(repo, "log", "--pretty=format:%h %s", diff_range_2dot)
+        log = _git(repo, "log", "--pretty=format:%h %s", _rng["log"])
         if log.returncode != 0:
             sys.exit(f"git log failed: {log.stderr.strip()}")
         commits = log.stdout.strip() or "(no commits in range)"
 
-        # When narrow=false but since_commit IS set (stage-1 annotation),
-        # also list the new commits since the prior anchor — reviewers use
-        # this to focus their scrutiny.
+        # Stage-1 annotation: when since_commit is set but we're showing the
+        # FULL feature diff (not a sub-range), list the new commits since the
+        # prior anchor so reviewers know where to focus.
         new_commits_since_prior = ""
-        if since_commit and not range_desc_narrow:
+        if since_commit and range_kind == "full":
             r = _git(repo, "log", "--pretty=format:%h %s",
                      f"{since_commit}..{branch}")
             if r.returncode == 0:
@@ -666,15 +719,22 @@ def load_code_input(
         if stat.returncode != 0:
             sys.exit(f"git diff --stat failed: {stat.stderr.strip()}")
 
+        # Human-readable scope descriptor, shared by the summary note, the
+        # label suffix, and the branch-section header.
+        if range_kind == "explicit_range":
+            scope_desc = (f"explicit commit range `{since_commit[:12]}..{to_commit[:12]}` "
+                          f"on branch `{branch}`")
+        elif range_kind == "feature_up_to":
+            scope_desc = f"branch `{branch}` as of commit `{to_commit[:12]}` (vs base `{base}`)"
+        elif range_kind == "narrow":
+            scope_desc = f"`{branch}` narrowed to commits since `{since_commit[:12]}`"
+        else:
+            scope_desc = f"`{branch}` compared to base `{base}`"
+
         if summary_only:
             label = f"branch {branch} vs {base} (summary)"
-            range_note = (
-                f"`{branch}` compared to base `{base}`"
-                if not range_desc_narrow
-                else f"`{branch}` NARROWED to commits since `{since_commit[:12]}`"
-            )
             payload = (
-                f"## Branch\n{range_note}\n\n"
+                f"## Scope\n{scope_desc}\n\n"
                 f"## Commits on this branch (oldest first)\n"
                 f"```\n{commits}\n```\n\n"
                 f"## File-level changes\n"
@@ -743,11 +803,32 @@ def load_code_input(
         label = f"branch {branch} vs {base}" + (f" (repo: {repo})" if repo else "")
         if only_globs:
             label += f" — only: {', '.join(only_globs)}"
-        if range_desc_narrow:
+        if range_kind == "explicit_range":
+            label += f" — range {since_commit[:12]}..{to_commit[:12]}"
+        elif range_kind == "feature_up_to":
+            label += f" — up to {to_commit[:12]}"
+        elif range_kind == "narrow":
             label += f" — NARROWED to commits since {since_commit[:12]}"
 
-        # Branch section header reflects narrow vs full mode.
-        if range_desc_narrow:
+        # Branch-section header per range kind. explicit_range and narrow
+        # carry the "REVIEW SCOPE IS A SUBSET" warning (code outside the
+        # range isn't visible); the marker text is what _run_review_pipeline
+        # keys off to add the cross-range reviewer instruction.
+        if range_kind == "explicit_range":
+            branch_section = (
+                f"## Scope\n**EXPLICIT COMMIT RANGE — REVIEW SCOPE IS A SUBSET.** "
+                f"Reviewing commits `{since_commit[:12]}..{to_commit[:12]}` on branch "
+                f"`{branch}` (base `{base}`). The diff below covers ONLY this range — "
+                f"commits before `{since_commit[:12]}` and after `{to_commit[:12]}` are "
+                f"NOT visible. See the task-instructions section for the implications.\n\n"
+            )
+        elif range_kind == "feature_up_to":
+            branch_section = (
+                f"## Scope\nReviewing branch `{branch}` **as of commit "
+                f"`{to_commit[:12]}`** (diff vs base `{base}`). Commits after "
+                f"`{to_commit[:12]}` are not included in this review.\n\n"
+            )
+        elif range_kind == "narrow":
             branch_section = (
                 f"## Branch\n`{branch}` is on top of base `{base}`. "
                 f"**NARROWED REVIEW SCOPE:** the diff below covers only "
@@ -1016,11 +1097,16 @@ def _run_review_pipeline(
     # instructions. Trailing blank line keeps the prompt visually clean.
     caller_block = f"{caller_context_md.rstrip()}\n\n" if caller_context_md else ""
 
-    # Narrow-mode detection (task #9 stage 2). load_code_input puts a
-    # specific marker into the payload when the diff was narrowed to
-    # commits-since-prior. Detect from the marker rather than threading
-    # another parameter through — narrowing is a payload-shape thing.
-    narrow_mode_active = "NARROWED REVIEW SCOPE" in payload
+    # Sub-range detection (task #9 narrow + task #13 explicit range).
+    # load_code_input stamps a marker into the payload when the diff covers
+    # only a SUBSET of the branch (narrow-since-prior, or an explicit
+    # from..to range). Either way the reviewer can't see code outside the
+    # range and needs the cross-range caveat. Detect from the marker rather
+    # than threading another parameter — scope is a payload-shape thing.
+    narrow_mode_active = (
+        "NARROWED REVIEW SCOPE" in payload
+        or "REVIEW SCOPE IS A SUBSET" in payload
+    )
 
     # Tests-in-parallel mode: defer the test block until reconcile so the
     # initial reviews can start immediately without waiting for `next build`.
@@ -1393,16 +1479,16 @@ def _branch_payload(
     )
     # Raw diff for caller-context analysis. Must use the SAME range as
     # load_code_input so the symbol-graph analysis sees the same set of
-    # changed lines the reviewer sees.
+    # changed lines the reviewer sees. (Multi-repo doesn't use to_commit —
+    # it's single-repo-only — so to_commit is None here.)
+    rng = _resolve_diff_range(branch, base, since_commit, None, narrow_to_recent_commits)
     raw_diff = ""
+    graph_ref = rng["end"]
     if not summary_only:
-        if narrow_to_recent_commits and since_commit:
-            r = _git(repo, "diff", f"{since_commit}..{branch}")
-        else:
-            r = _git(repo, "diff", f"{base}...{branch}")
+        r = _git(repo, "diff", rng["diff"])
         if r.returncode == 0:
             raw_diff = r.stdout
-    return label, payload, {}, raw_diff
+    return label, payload, {}, raw_diff, graph_ref
 
 
 def review_multi_repo_structured(
@@ -1421,12 +1507,17 @@ def review_multi_repo_structured(
     caller_depth: int = 2,
     prior_head_shas: dict | None = None,
     since_commit: str | None = None,
+    to_commit: str | None = None,
     narrow_to_recent_commits: bool = False,
 ) -> dict:
     """Run a single review whose subject is changes across multiple repos.
 
     Each entry in `repos` is {repo: <local path>, repo_url: <url>, branch: <name>,
     base: <name>}. The server is responsible for cloning/fetching before calling.
+
+    `to_commit` (task #13) is single-repo-only — an explicit end SHA is
+    ambiguous across multiple repos — so it is IGNORED here. Use a
+    single-repo submission to review an explicit from..to range.
 
     `caller_depth` controls the symbol-graph caller-context analysis
     (task #10): 1 = direct callers only, 2 = one hop of indirect callers
@@ -1466,7 +1557,7 @@ def review_multi_repo_structured(
         if per_repo_since:
             info(f"  since anchor: {per_repo_since[:12]} (from prior iteration)")
 
-        sub_label, sub_payload, _, raw_diff = _branch_payload(
+        sub_label, sub_payload, _, raw_diff, sub_graph_ref = _branch_payload(
             repo=repo_path, branch=branch, base=base,
             only_globs=only_globs or [], include_all=include_all,
             summary_only=summary_only,
@@ -1490,7 +1581,7 @@ def review_multi_repo_structured(
                 # branch so def line numbers align with the diff hunk lines
                 # (option A — avoids origin/main line-drift false negatives).
                 cc = build_caller_context(
-                    repo_path, raw_diff, depth=caller_depth, graph_ref=branch,
+                    repo_path, raw_diff, depth=caller_depth, graph_ref=sub_graph_ref,
                 )
                 if cc.get("section_md"):
                     caller_context_sections.append(
@@ -1597,9 +1688,12 @@ def review_multi_repo_structured(
     fallback_repos = [
         _short(p["repo_url"]) for p in cr_per_repo if p["narrow_fallback"]
     ]
+    if to_commit:
+        info("to_commit is ignored for multi-repo reviews (single-repo only)")
     result["commit_range"] = {
         "narrow_to_recent_commits": narrow_to_recent_commits,
         "explicit_since_commit": since_commit,
+        "explicit_to_commit": None,  # ignored for multi-repo
         "per_repo": cr_per_repo,
         "narrow_fallback_reason": (
             f"narrow_to_recent_commits was requested, but {len(fallback_repos)} "
@@ -1619,6 +1713,7 @@ def review_multi_repo_structured(
         "summary_only": summary_only,
         "caller_depth": caller_depth,
         "since_commit": since_commit,
+        "to_commit": None,  # ignored for multi-repo
         "narrow_to_recent_commits": narrow_to_recent_commits,
     }
     return result
@@ -1642,6 +1737,7 @@ def review_branch_structured(
     caller_depth: int = 2,
     prior_head_shas: dict | None = None,
     since_commit: str | None = None,
+    to_commit: str | None = None,
     narrow_to_recent_commits: bool = False,
 ) -> dict:
     """Server-friendly entrypoint. Runs a branch review and returns a structured result.
@@ -1651,6 +1747,10 @@ def review_branch_structured(
 
     `caller_depth` controls the symbol-graph caller-context analysis
     (task #10): 1 = direct callers only, 2 = one-hop indirect.
+
+    `to_commit` (task #13) caps the review's END at an explicit commit.
+    With since_commit it reviews the range since..to; alone it reviews the
+    feature up to that commit (base...to).
     """
     roles = load_roles("review")
     if "claude" not in roles or "codex" not in roles:
@@ -1664,14 +1764,22 @@ def review_branch_structured(
     if not effective_since and prior_head_shas:
         effective_since = next(iter(prior_head_shas.values()), None)
 
+    # Effective narrow flag: an explicit to_commit also produces a sub-range
+    # diff, independent of narrow_to_recent_commits.
+    effective_narrow = narrow_to_recent_commits and bool(effective_since)
+
     label, payload = load_code_input(
         None, None, branch, base, repo,
         only_globs=only_globs or [],
         include_all=include_all,
         summary_only=summary_only,
         since_commit=effective_since,
-        narrow_to_recent_commits=narrow_to_recent_commits and bool(effective_since),
+        to_commit=to_commit,
+        narrow_to_recent_commits=effective_narrow,
     )
+
+    # The diff range + the commit whose line frame it's in (for graph_ref).
+    _rng = _resolve_diff_range(branch, base, effective_since, to_commit, effective_narrow)
 
     parts: list[str] = []
     handoff = _load_handoff(branch, repo, handoff_path, no_handoff, feature)
@@ -1694,18 +1802,16 @@ def review_branch_structured(
     }
     if not summary_only:
         try:
-            # Use the same diff range as load_code_input so caller-context
-            # analysis sees the same set of changed lines.
-            if narrow_to_recent_commits and effective_since:
-                r = _git(repo, "diff", f"{effective_since}..{branch}")
-            else:
-                r = _git(repo, "diff", f"{base}...{branch}")
+            # Use the SAME diff range as load_code_input so caller-context
+            # analysis sees the same changed lines (task #9/#13 ranges).
+            r = _git(repo, "diff", _rng["diff"])
             if r.returncode == 0 and r.stdout:
                 from caller_lookup import build_caller_context
-                # graph_ref=branch — build the graph from the feature branch
-                # so def line numbers match the diff hunks (option A).
+                # graph_ref = the range END so def line numbers match the
+                # diff hunks (option A line-alignment; for an explicit
+                # range the end is to_commit, not the branch HEAD).
                 cc = build_caller_context(
-                    repo, r.stdout, depth=caller_depth, graph_ref=branch,
+                    repo, r.stdout, depth=caller_depth, graph_ref=_rng["end"],
                 )
                 if cc.get("section_md"):
                     caller_context_md = cc["section_md"]
@@ -1732,16 +1838,23 @@ def review_branch_structured(
     result["caller_context"] = caller_context_meta
     result["handoff_source"] = handoff_source
     result["handoff_content"] = handoff_content
-    _single_fallback = narrow_to_recent_commits and not bool(effective_since)
+    # Fallback only applies to the narrow path; an explicit to_commit
+    # always produces a real range (no anchor needed).
+    _single_fallback = (
+        narrow_to_recent_commits and not to_commit and not bool(effective_since)
+    )
     result["commit_range"] = {
         "narrow_to_recent_commits": narrow_to_recent_commits,
         "explicit_since_commit": since_commit,
+        "explicit_to_commit": to_commit,
+        "range_kind": _rng["kind"],
         "per_repo": [{
             "repo_url": repo,
             "branch": branch,
             "base": base,
             "since_anchor": effective_since,
-            "narrowed": narrow_to_recent_commits and bool(effective_since),
+            "to_commit": to_commit,
+            "narrowed": _rng["kind"] in ("explicit_range", "narrow"),
             "narrow_fallback": _single_fallback,
         }],
         "narrow_fallback_reason": (
@@ -1762,6 +1875,7 @@ def review_branch_structured(
         "no_handoff": no_handoff,
         "caller_depth": caller_depth,
         "since_commit": since_commit,
+        "to_commit": to_commit,
         "narrow_to_recent_commits": narrow_to_recent_commits,
     }
     return result

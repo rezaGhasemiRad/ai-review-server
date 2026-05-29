@@ -372,6 +372,16 @@ function renderSubmissionCard(j, r){
       warn:true,
     });
   }
+  // Explicit end-of-range (task #13). With since_commit -> reviewed A..B;
+  // alone -> feature up to B. Warn-flagged: like narrow, the reviewer sees
+  // only a subset of the branch.
+  if(req.to_commit){
+    flagBits.push({
+      label:'to_commit='+req.to_commit.slice(0,12),
+      title:'Review END capped at this commit. With since_commit the diff is the range A..B; alone it is the feature up to this commit (base...B). Commits after it are not reviewed.',
+      warn:true,
+    });
+  }
   // If there's literally nothing meaningful to show, render nothing.
   if(!ctx && !handoffSrc && !handoffBody && !flagBits.length) return '';
 
@@ -760,8 +770,9 @@ async function loadDetail(){
     const perRepo = (cr && cr.per_repo) || [];
     const anyNarrow = perRepo.some(p => p.narrowed);
     const anyAnchor = perRepo.some(p => p.since_anchor);
+    const anyTo = perRepo.some(p => p.to_commit);
     const fallbackReason = cr && cr.narrow_fallback_reason;
-    if(perRepo.length && (anyAnchor || anyNarrow || fallbackReason || Object.keys(headShas).length)){
+    if(perRepo.length && (anyAnchor || anyNarrow || anyTo || fallbackReason || Object.keys(headShas).length)){
       h += '<div class="card"><h3 style="margin:0 0 10px">'+
         'Reviewed range</h3>';
       if(anyNarrow){
@@ -786,22 +797,32 @@ async function loadDetail(){
         '<th style="padding:4px 8px">Repo</th>'+
         '<th style="padding:4px 8px">Branch</th>'+
         '<th style="padding:4px 8px">Base</th>'+
-        '<th style="padding:4px 8px">Since anchor</th>'+
-        '<th style="padding:4px 8px">Reviewed HEAD</th>'+
+        '<th style="padding:4px 8px">Range start</th>'+
+        '<th style="padding:4px 8px">Range end</th>'+
         '<th style="padding:4px 8px">Scope</th>'+
         '</tr></thead><tbody>';
       h += perRepo.map(p => {
         const repoShort = shortRepo(p.repo_url||'');
         const head = headShas[p.repo_url] || '';
         const since = p.since_anchor || '';
-        const scope = p.narrowed ? '<span style="color:#92400e">narrowed</span>'
-                                 : (since ? 'full + anchor' : 'full');
+        const toC = p.to_commit || '';
+        // Range start: since-anchor if present, else "base". Range end:
+        // explicit to_commit if present, else the reviewed HEAD.
+        const startCell = since ? esc(since.slice(0,12))
+                                : '<span class="muted">base</span>';
+        const endCell = toC ? esc(toC.slice(0,12))
+                            : (head ? esc(head.slice(0,12)) : '<span class="muted">HEAD</span>');
+        let scope;
+        if(toC && since) scope = '<span style="color:#92400e">range A..B</span>';
+        else if(toC)     scope = '<span style="color:#92400e">up to commit</span>';
+        else if(p.narrowed) scope = '<span style="color:#92400e">narrowed</span>';
+        else scope = since ? 'full + anchor' : 'full';
         return '<tr style="border-top:1px solid var(--line)">'+
           '<td style="padding:4px 8px">'+esc(repoShort)+'</td>'+
           '<td style="padding:4px 8px">'+esc((p.branch||'').replace('origin/',''))+'</td>'+
           '<td style="padding:4px 8px">'+esc((p.base||'').replace('origin/',''))+'</td>'+
-          '<td style="padding:4px 8px">'+(since ? esc(since.slice(0,12)) : '<span class="muted">—</span>')+'</td>'+
-          '<td style="padding:4px 8px">'+(head ? esc(head.slice(0,12)) : '<span class="muted">—</span>')+'</td>'+
+          '<td style="padding:4px 8px">'+startCell+'</td>'+
+          '<td style="padding:4px 8px">'+endCell+'</td>'+
           '<td style="padding:4px 8px">'+scope+'</td>'+
           '</tr>';
       }).join('');

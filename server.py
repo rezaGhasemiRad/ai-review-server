@@ -418,6 +418,13 @@ class ReviewRequest(BaseModel):
     since_commit: Optional[str] = None
     narrow_to_recent_commits: bool = False
 
+    # Explicit range END (task #13). Caps the review at a specific commit.
+    # - with since_commit  -> review the range since_commit..to_commit (A..B)
+    # - alone              -> review the feature up to to_commit (base...to_commit)
+    # Single-repo only (an explicit SHA is ambiguous across repos); ignored
+    # for multi-repo submissions.
+    to_commit: Optional[str] = None
+
     @field_validator("project", "feature")
     @classmethod
     def _check_label(cls, v: Optional[str]) -> Optional[str]:
@@ -457,9 +464,9 @@ class ReviewRequest(BaseModel):
             raise ValueError("caller_depth must be 1 or 2 (depth>2 is not supported)")
         return n
 
-    @field_validator("since_commit")
+    @field_validator("since_commit", "to_commit")
     @classmethod
-    def _check_since_commit(cls, v: Optional[str]) -> Optional[str]:
+    def _check_commit_sha(cls, v: Optional[str]) -> Optional[str]:
         if v is None:
             return v
         v = v.strip()
@@ -468,7 +475,7 @@ class ReviewRequest(BaseModel):
         # Accept 7+ hex chars (short SHA) up to 40 (full SHA). Reachability
         # validation happens at review time when we have the repo handy.
         if not re.fullmatch(r"[0-9a-fA-F]{7,40}", v):
-            raise ValueError("since_commit must be a git SHA (7-40 hex chars)")
+            raise ValueError("commit SHA must be 7-40 hex chars")
         return v.lower()
 
     def normalized_repos(self) -> list[RepoSpec]:
@@ -943,6 +950,7 @@ def _run_job(job_id: str) -> None:
             # the actual diff range narrows when narrow=true.
             prior_head_shas=prior_head_shas,
             since_commit=req.get("since_commit"),
+            to_commit=req.get("to_commit"),
             narrow_to_recent_commits=bool(req.get("narrow_to_recent_commits", False)),
         )
 
@@ -1122,7 +1130,7 @@ def submit_review(req: ReviewRequest, request: Request) -> JobSubmitted:
     # was to silently fall back to a full-diff review at full token cost —
     # the coder AI thought it was narrowing but wasn't. Reject instead so
     # the caller knows and can decide.
-    if req.narrow_to_recent_commits and not req.since_commit:
+    if req.narrow_to_recent_commits and not req.since_commit and not req.to_commit:
         if not req.previous_job_id:
             raise HTTPException(
                 status_code=400,
