@@ -27,7 +27,7 @@ MODEL_CALL_RETRIES = 1       # total attempts = RETRIES + 1
 MODEL_CALL_BACKOFF_S = 10
 
 # Hard cap on diff payload — model context limits.
-MAX_REVIEW_CHARS = 500_000
+MAX_REVIEW_CHARS = 1_100_000
 
 # Path patterns that almost never carry signal in a feature-branch review.
 # The filter runs only when the caller didn't pass explicit `only` globs;
