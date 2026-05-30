@@ -28,6 +28,11 @@ MODEL_CALL_BACKOFF_S = 10
 
 # Hard cap on diff payload — model context limits.
 MAX_REVIEW_CHARS = 1_100_000
+# Claude-only reviews aren't bound by Codex's ~400K-token window, so they
+# can take a much larger diff (Opus 4.8 holds ~1M tokens ≈ ~4M chars). Used
+# as the cap when a submission selects Claude as the sole reviewer — lets
+# big cases (e.g. a whole multi-repo feature) be reviewed in one pass.
+MAX_REVIEW_CHARS_CLAUDE_ONLY = 3_000_000
 
 # Path patterns that almost never carry signal in a feature-branch review.
 # The filter runs only when the caller didn't pass explicit `only` globs;
@@ -638,8 +643,12 @@ def load_code_input(
     since_commit: str | None = None,
     to_commit: str | None = None,
     narrow_to_recent_commits: bool = False,
+    max_chars: int | None = None,
 ) -> tuple[str, str]:
     """Return (label, content) for the review subject.
+
+    `max_chars` overrides the diff size cap (default MAX_REVIEW_CHARS).
+    Claude-only reviews pass the larger MAX_REVIEW_CHARS_CLAUDE_ONLY.
 
     Task #9 — commit-range review:
     - `since_commit` is the anchor SHA for "review only commits since X".
@@ -786,12 +795,13 @@ def load_code_input(
                 f"({len(repo_excludes)} globs): {preview}{extra}"
             )
 
-        if len(filtered) > MAX_REVIEW_CHARS:
+        cap = max_chars if max_chars else MAX_REVIEW_CHARS
+        if len(filtered) > cap:
             kept_preview = "\n  ".join(fstats["kept_paths"][:30])
             extra = "" if fstats["kept_files"] <= 30 else f"\n  ... +{fstats['kept_files'] - 30} more"
             sys.exit(
                 f"Diff is still {len(filtered):,} chars after filtering "
-                f"(raw was {raw_chars:,}, cap is {MAX_REVIEW_CHARS:,}).\n\n"
+                f"(raw was {raw_chars:,}, cap is {cap:,}).\n\n"
                 f"Files still in scope:\n  {kept_preview}{extra}\n\n"
                 f"Options:\n"
                 f"  --only <glob>      restrict to specific paths (repeatable)\n"
@@ -1070,8 +1080,15 @@ def _run_review_pipeline(
     progress_cb=None,
     tests_future: Future | None = None,
     caller_context_md: str = "",
+    reviewers: list[str] | None = None,
 ) -> dict:
     """Two-phase review pipeline shared by the CLI and the HTTP server.
+
+    `reviewers` selects which models review (default both Claude + Codex).
+    Pass ["claude"] for a Claude-only review (used for big diffs that exceed
+    Codex's context window). With a single reviewer there's no second opinion
+    to reconcile against, so the reconcile phase + disagreement matrix are
+    skipped and the single phase-1 review is final.
 
     `tests_future`, if set, is awaited just before the reconcile phase. This
     lets the server run tests in the background while the initial reviews are
@@ -1087,6 +1104,12 @@ def _run_review_pipeline(
     on resolving disagreements about findings already raised.
     """
     cb = progress_cb if callable(progress_cb) else (lambda _m: None)
+    # Normalize reviewers: keep only known reviewers, preserve order, default
+    # to both. Empty/garbage falls back to both so a bad request still runs.
+    reviewers = [r for r in (reviewers or []) if r in ("claude", "codex")] or ["claude", "codex"]
+    run_claude = "claude" in reviewers
+    run_codex = "codex" in reviewers
+    single_reviewer = len(reviewers) < 2
     context_block = f"# Context\n{extra_context}\n\n" if extra_context else ""
 
     prior_block = _build_prior_iteration_section(prior_result)
@@ -1215,24 +1238,32 @@ def _run_review_pipeline(
         for k in ("input_tokens", "output_tokens", "usd"):
             usage_acc[who][k] += u.get(k, 0) or 0
 
-    # Phase 1 — independent reviews. Claude and Codex are independent; run
-    # them concurrently. Each CLI call is bounded by MODEL_CALL_TIMEOUT_S so
-    # there's no risk of one wedging the other indefinitely.
-    info("phase 1/2 — independent reviews (Claude + Codex in parallel)")
-    cb("phase 1/2 · Claude+Codex reviewing in parallel")
+    # Phase 1 — independent reviews. The selected reviewers run concurrently.
+    # Each CLI call is bounded by MODEL_CALL_TIMEOUT_S so there's no risk of
+    # one wedging the other indefinitely.
+    who = " + ".join(r.capitalize() for r in reviewers)
+    info(f"phase 1/2 — independent reviews ({who})")
+    cb(f"phase 1/2 · {who} reviewing")
+    # Defaults for any reviewer that doesn't run this job.
+    claude_review, claude_block, u_c = "", None, dict(EMPTY_USAGE)
+    codex_review, codex_block, u_x = "", None, dict(EMPTY_USAGE)
     with ThreadPoolExecutor(max_workers=2, thread_name_prefix="review") as ex:
-        fut_c = ex.submit(call_claude, roles["claude"], initial_msg)
-        fut_x = ex.submit(call_codex, roles["codex"], initial_msg)
-        claude_review, u_c = fut_c.result()
-        codex_review, u_x = fut_x.result()
-    _add("claude", u_c)
-    _add("codex", u_x)
-    claude_review, claude_block = _extract_findings_block(claude_review)
-    codex_review, codex_block = _extract_findings_block(codex_review)
-    speak("claude", claude_review)
-    speak("codex", codex_review)
-    history.append({"speaker": "claude (initial)", "text": claude_review})
-    history.append({"speaker": "codex (initial)", "text": codex_review})
+        fut_c = ex.submit(call_claude, roles["claude"], initial_msg) if run_claude else None
+        fut_x = ex.submit(call_codex, roles["codex"], initial_msg) if run_codex else None
+        if fut_c is not None:
+            claude_review, u_c = fut_c.result()
+        if fut_x is not None:
+            codex_review, u_x = fut_x.result()
+    if run_claude:
+        _add("claude", u_c)
+        claude_review, claude_block = _extract_findings_block(claude_review)
+        speak("claude", claude_review)
+        history.append({"speaker": "claude (initial)", "text": claude_review})
+    if run_codex:
+        _add("codex", u_x)
+        codex_review, codex_block = _extract_findings_block(codex_review)
+        speak("codex", codex_review)
+        history.append({"speaker": "codex (initial)", "text": codex_review})
 
     # If tests were deferred, await them now so the reconcile prompt can
     # include them. We block here at the boundary between phase 1 and 2 —
@@ -1267,7 +1298,27 @@ def _run_review_pipeline(
         and not codex_findings_p1
         and not test_failures
     )
-    if both_clean:
+    if single_reviewer:
+        # One reviewer — its phase-1 review IS the final review. There's no
+        # second opinion to reconcile against, so skip phase 2 entirely.
+        sole = reviewers[0]
+        info(f"phase 2/2 — skipped (single-reviewer mode: {sole} only)")
+        cb(f"phase 2/2 · skipped ({sole}-only review)")
+        skip_note = (
+            f"Single-reviewer review ({sole} only) — no second reviewer to "
+            f"reconcile against. The review above is final. (Used for large "
+            f"diffs that exceed the other reviewer's context window.)"
+        )
+        claude_reconcile = skip_note if run_claude else ""
+        codex_reconcile = skip_note if run_codex else ""
+        claude_peer_assessment: list = []
+        codex_peer_assessment: list = []
+        if run_claude:
+            history.append({"speaker": "claude (final)", "text": claude_reconcile})
+        if run_codex:
+            history.append({"speaker": "codex (final)", "text": codex_reconcile})
+        cb("finalizing")
+    elif both_clean:
         info("phase 2/2 — skipped (both reviewers approved with no findings, "
              "no test failures)")
         cb("phase 2/2 · skipped (clean review)")
@@ -1442,8 +1493,11 @@ def _run_review_pipeline(
         # corresponding peer's findings array.
         "claude_peer_assessment": claude_peer_assessment,
         "codex_peer_assessment": codex_peer_assessment,
-        "claude_verdict": _verdict_from_block_or_text(claude_block, claude_review),
-        "codex_verdict": _verdict_from_block_or_text(codex_block, codex_review),
+        "claude_verdict": _verdict_from_block_or_text(claude_block, claude_review) if run_claude else None,
+        "codex_verdict": _verdict_from_block_or_text(codex_block, codex_review) if run_codex else None,
+        # Which reviewers actually ran (default both). Consumers/UI use this
+        # to distinguish "reviewer didn't run" from "reviewer found nothing".
+        "reviewers": reviewers,
         "usage": usage,
         "transcript_path": str(transcript_path),
         "transcript_md": transcript_md,
@@ -1459,6 +1513,7 @@ def _branch_payload(
     summary_only: bool,
     since_commit: str | None = None,
     narrow_to_recent_commits: bool = False,
+    max_chars: int | None = None,
 ) -> tuple[str, str, dict, str]:
     """Build the payload for a single (repo, branch, base) triple.
 
@@ -1476,6 +1531,7 @@ def _branch_payload(
         only_globs=only_globs, include_all=include_all, summary_only=summary_only,
         since_commit=since_commit,
         narrow_to_recent_commits=narrow_to_recent_commits,
+        max_chars=max_chars,
     )
     # Raw diff for caller-context analysis. Must use the SAME range as
     # load_code_input so the symbol-graph analysis sees the same set of
@@ -1509,11 +1565,16 @@ def review_multi_repo_structured(
     since_commit: str | None = None,
     to_commit: str | None = None,
     narrow_to_recent_commits: bool = False,
+    reviewers: list[str] | None = None,
 ) -> dict:
     """Run a single review whose subject is changes across multiple repos.
 
     Each entry in `repos` is {repo: <local path>, repo_url: <url>, branch: <name>,
     base: <name>}. The server is responsible for cloning/fetching before calling.
+
+    `reviewers` (default both) selects which models review. ["claude"] runs a
+    Claude-only review with a larger size cap — for big multi-repo features
+    that exceed Codex's context window.
 
     `to_commit` (task #13) is single-repo-only — an explicit end SHA is
     ambiguous across multiple repos — so it is IGNORED here. Use a
@@ -1529,6 +1590,11 @@ def review_multi_repo_structured(
     roles = load_roles("review")
     if "claude" not in roles or "codex" not in roles:
         raise RuntimeError("prompts/review.md must contain '### CLAUDE' and '### CODEX' sections")
+
+    # Effective size cap: Claude-only reviews aren't bound by Codex's window,
+    # so they get the larger cap (big multi-repo features in one pass).
+    reviewers_norm = [r for r in (reviewers or []) if r in ("claude", "codex")] or ["claude", "codex"]
+    eff_cap = MAX_REVIEW_CHARS_CLAUDE_ONLY if reviewers_norm == ["claude"] else MAX_REVIEW_CHARS
 
     sections: list[str] = []
     caller_context_sections: list[str] = []
@@ -1563,6 +1629,7 @@ def review_multi_repo_structured(
             summary_only=summary_only,
             since_commit=per_repo_since,
             narrow_to_recent_commits=narrow_to_recent_commits and bool(per_repo_since),
+            max_chars=eff_cap,
         )
         repo_labels.append(repo_id)
         sections.append(
@@ -1607,10 +1674,12 @@ def review_multi_repo_structured(
     combined_payload = "\n\n---\n\n".join(sections)
     label = f"multi-repo feature across {len(repos)} repos: " + ", ".join(repo_labels)
 
-    if len(combined_payload) > MAX_REVIEW_CHARS:
+    if len(combined_payload) > eff_cap:
+        hint = ("Use 'only' globs, set 'summary_only': true, or split into separate reviews."
+                if reviewers_norm != ["claude"]
+                else "Even for a Claude-only review this exceeds the cap; split or use 'only' globs.")
         raise RuntimeError(
-            f"Combined diff is {len(combined_payload):,} chars (cap {MAX_REVIEW_CHARS:,}). "
-            f"Use 'only' globs, set 'summary_only': true, or split into separate reviews."
+            f"Combined diff is {len(combined_payload):,} chars (cap {eff_cap:,}). {hint}"
         )
 
     parts: list[str] = []
@@ -1646,6 +1715,7 @@ def review_multi_repo_structured(
         prior_result=prior_result, test_results_by_repo=test_results_by_repo,
         progress_cb=progress_cb, tests_future=tests_future,
         caller_context_md=caller_context_md,
+        reviewers=reviewers_norm,
     )
     result["handoff_source"] = handoff_source
     # Persist the full handoff text so the UI can render it on the detail
@@ -1715,6 +1785,7 @@ def review_multi_repo_structured(
         "since_commit": since_commit,
         "to_commit": None,  # ignored for multi-repo
         "narrow_to_recent_commits": narrow_to_recent_commits,
+        "reviewers": reviewers_norm,
     }
     return result
 
@@ -1739,6 +1810,7 @@ def review_branch_structured(
     since_commit: str | None = None,
     to_commit: str | None = None,
     narrow_to_recent_commits: bool = False,
+    reviewers: list[str] | None = None,
 ) -> dict:
     """Server-friendly entrypoint. Runs a branch review and returns a structured result.
 
@@ -1751,10 +1823,19 @@ def review_branch_structured(
     `to_commit` (task #13) caps the review's END at an explicit commit.
     With since_commit it reviews the range since..to; alone it reviews the
     feature up to that commit (base...to).
+
+    `reviewers` (default both) selects which models review. ["claude"] runs a
+    Claude-only review with a larger size cap — for big diffs that exceed
+    Codex's context window.
     """
     roles = load_roles("review")
     if "claude" not in roles or "codex" not in roles:
         raise RuntimeError("prompts/review.md must contain '### CLAUDE' and '### CODEX' sections")
+
+    # Effective size cap: Claude-only gets the larger cap (Codex's window
+    # doesn't bind when Codex isn't reviewing).
+    reviewers_norm = [r for r in (reviewers or []) if r in ("claude", "codex")] or ["claude", "codex"]
+    eff_cap = MAX_REVIEW_CHARS_CLAUDE_ONLY if reviewers_norm == ["claude"] else MAX_REVIEW_CHARS
 
     # Resolve since-anchor for stage-1 annotation / stage-2 narrowing
     # (task #9). Explicit since_commit wins; otherwise look up the prior
@@ -1776,6 +1857,7 @@ def review_branch_structured(
         since_commit=effective_since,
         to_commit=to_commit,
         narrow_to_recent_commits=effective_narrow,
+        max_chars=eff_cap,
     )
 
     # The diff range + the commit whose line frame it's in (for graph_ref).
@@ -1834,6 +1916,7 @@ def review_branch_structured(
         prior_result=prior_result, test_results_by_repo=test_results_by_repo,
         progress_cb=progress_cb, tests_future=tests_future,
         caller_context_md=caller_context_md,
+        reviewers=reviewers_norm,
     )
     result["caller_context"] = caller_context_meta
     result["handoff_source"] = handoff_source
@@ -1877,6 +1960,7 @@ def review_branch_structured(
         "since_commit": since_commit,
         "to_commit": to_commit,
         "narrow_to_recent_commits": narrow_to_recent_commits,
+        "reviewers": reviewers_norm,
     }
     return result
 

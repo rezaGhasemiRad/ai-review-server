@@ -231,12 +231,17 @@ def _notify_job_done(job_id: str) -> None:
         tout = usage.get("total_output_tokens") or 0
         claude_usd = (usage.get("claude") or {}).get("usd")
         w = _window_pct(claude_usd, job_id=job_id)
-        body = (
-            f"Review COMPLETE — {pf}\n"
-            f"Claude: {cv} ({cf} findings)\n"
-            f"Codex:  {xv} ({xf} findings)\n"
-            f"Tokens: {tin:,} in / {tout:,} out\n"
-        )
+        # Only show reviewers that actually ran (Claude-only reviews omit Codex).
+        ran = result.get("reviewers") or ["claude", "codex"]
+        lines = [f"Review COMPLETE — {pf}"]
+        if "claude" in ran:
+            lines.append(f"Claude: {cv} ({cf} findings)")
+        if "codex" in ran:
+            lines.append(f"Codex:  {xv} ({xf} findings)")
+        if ran == ["claude"] or ran == ["codex"]:
+            lines.append(f"(single-reviewer: {ran[0]} only)")
+        lines.append(f"Tokens: {tin:,} in / {tout:,} out")
+        body = "\n".join(lines) + "\n"
         if w:
             body += (
                 f"Window: {w['pct']:.2f}% this job · "
@@ -418,6 +423,11 @@ class ReviewRequest(BaseModel):
     since_commit: Optional[str] = None
     narrow_to_recent_commits: bool = False
 
+    # Which models review (default both). ["claude"] = Claude-only review with
+    # a larger size cap — for big diffs that exceed Codex's context window.
+    # Valid entries: "claude", "codex".
+    reviewers: list[str] = ["claude", "codex"]
+
     # Explicit range END (task #13). Caps the review at a specific commit.
     # - with since_commit  -> review the range since_commit..to_commit (A..B)
     # - alone              -> review the feature up to to_commit (base...to_commit)
@@ -463,6 +473,21 @@ class ReviewRequest(BaseModel):
         if n not in (1, 2):
             raise ValueError("caller_depth must be 1 or 2 (depth>2 is not supported)")
         return n
+
+    @field_validator("reviewers")
+    @classmethod
+    def _check_reviewers(cls, v: list[str]) -> list[str]:
+        if not v:
+            return ["claude", "codex"]
+        cleaned, seen = [], set()
+        for r in v:
+            r = str(r).strip().lower()
+            if r not in ("claude", "codex"):
+                raise ValueError("reviewers entries must be 'claude' or 'codex'")
+            if r not in seen:
+                seen.add(r)
+                cleaned.append(r)
+        return cleaned
 
     @field_validator("since_commit", "to_commit")
     @classmethod
@@ -952,6 +977,8 @@ def _run_job(job_id: str) -> None:
             since_commit=req.get("since_commit"),
             to_commit=req.get("to_commit"),
             narrow_to_recent_commits=bool(req.get("narrow_to_recent_commits", False)),
+            # Which models review (default both). ["claude"] = Claude-only.
+            reviewers=req.get("reviewers") or ["claude", "codex"],
         )
 
         if len(prepared) == 1:

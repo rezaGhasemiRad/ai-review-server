@@ -382,6 +382,14 @@ function renderSubmissionCard(j, r){
       warn:true,
     });
   }
+  // Reviewer selection (single-reviewer mode). Default is both claude+codex.
+  if(Array.isArray(req.reviewers) && req.reviewers.length && req.reviewers.length < 2){
+    flagBits.push({
+      label:'reviewers='+req.reviewers.join(','),
+      title:'Single-reviewer review (larger size cap, no second opinion / reconcile). Used for big diffs that exceed the other reviewer\'s context window.',
+      warn:true,
+    });
+  }
   // If there's literally nothing meaningful to show, render nothing.
   if(!ctx && !handoffSrc && !handoffBody && !flagBits.length) return '';
 
@@ -845,13 +853,23 @@ async function loadDetail(){
   // Claude's findings; r.claude_peer_assessment is Claude's stance on
   // Codex's findings.
   if(r.claude_findings || r.codex_findings){
-    h += '<div class="card"><h3 style="margin:0 0 10px">Findings</h3><div class="fgrid">'+
-      '<div><div class="muted" style="margin-bottom:4px">Claude · '+
-        (r.claude_findings||[]).length+'</div>'+
-        renderFindings(r.claude_findings, r.codex_peer_assessment, 'Codex')+'</div>'+
-      '<div><div class="muted" style="margin-bottom:4px">Codex · '+
-        (r.codex_findings||[]).length+'</div>'+
-        renderFindings(r.codex_findings, r.claude_peer_assessment, 'Claude')+'</div>'+
+    // Which reviewers ran (default both). A reviewer that didn't run shows
+    // "not run" so an empty column isn't misread as "reviewed, found nothing".
+    const ran = r.reviewers || ['claude','codex'];
+    const claudeRan = ran.indexOf('claude') !== -1;
+    const codexRan = ran.indexOf('codex') !== -1;
+    const single = ran.length === 1;
+    const col = (name, ran, findings, peer, other) =>
+      '<div><div class="muted" style="margin-bottom:4px">'+name+' · '+
+        (ran ? (findings||[]).length : '<span style="color:#92400e">not run</span>')+'</div>'+
+        (ran ? renderFindings(findings, peer, other)
+             : '<span class="muted">'+name+' did not review this job (single-reviewer mode)</span>')+
+      '</div>';
+    h += '<div class="card"><h3 style="margin:0 0 10px">Findings'+
+      (single ? ' <span class="muted" style="font-size:12px">('+ran[0]+'-only review)</span>' : '')+
+      '</h3><div class="fgrid">'+
+      col('Claude', claudeRan, r.claude_findings, r.codex_peer_assessment, 'Codex')+
+      col('Codex', codexRan, r.codex_findings, r.claude_peer_assessment, 'Claude')+
       '</div></div>';
   }
 
