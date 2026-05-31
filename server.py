@@ -85,15 +85,17 @@ def _load_env_file(path: pathlib.Path) -> dict:
 
 TELEGRAM = _load_env_file(ALERTS_ENV)
 
-# Subscription-window budget for the per-job % display. The user's coder AI
-# and the review server's Claude calls share the same Anthropic account's
-# 5-hour Opus quota, so the cost of each review is meaningfully read against
-# this budget. Defaults are tuned for Claude Code Max 5×; tweak via env to
-# match your actual plan tier.
+# Subscription-window budget for the per-job % display. The Max-plan 5h limit
+# is metered by TOKEN THROUGHPUT, not dollars — and the CLI's total_cost_usd is
+# cache-discounted (cache reads bill at 10% in USD but still consume the window),
+# so a USD-based estimate badly under-counts. We meter Claude tokens (input +
+# output, cache-inclusive) against a token budget instead. Default is calibrated
+# to an observed data point on Max 5× (≈363K review tokens ≈ 23% of window →
+# ~1.58M tokens). Tune via env to match your plan/observation.
 try:
-    OPUS_5H_BUDGET_USD = float(os.environ.get("OPUS_5H_BUDGET_USD", "75"))
+    OPUS_5H_TOKEN_BUDGET = int(float(os.environ.get("OPUS_5H_TOKEN_BUDGET", "1580000")))
 except ValueError:
-    OPUS_5H_BUDGET_USD = 75.0
+    OPUS_5H_TOKEN_BUDGET = 1_580_000
 OPUS_PLAN_LABEL = os.environ.get("OPUS_PLAN_LABEL", "Max 5×").strip() or "Max 5×"
 
 # Default caller-context depth for symbol-graph analysis (task #10).
@@ -103,83 +105,97 @@ OPUS_PLAN_LABEL = os.environ.get("OPUS_PLAN_LABEL", "Max 5×").strip() or "Max 5
 DEFAULT_CALLER_DEPTH = 2
 
 
-def _rolling_review_usd_5h(now: float | None = None, exclude_job_id: str | None = None) -> tuple[float, int]:
-    """Sum the Claude USD spent across this server's reviews completed in the
-    last 5 hours. This is the *review server's* contribution to the user's
-    Anthropic-account 5h Opus window — coder AI sessions and other projects
-    on the same account stay invisible and must be added mentally.
+def _claude_tokens(claude_usage: dict | None) -> int:
+    """Total Claude tokens (input + output) for a job. `input_tokens` is the
+    cache-inclusive sum recorded by ai_chat.call_claude, so this approximates
+    the throughput the subscription quota actually meters — a far better proxy
+    for the 5h window than the cache-discounted USD figure."""
+    c = claude_usage or {}
+    try:
+        return int(c.get("input_tokens") or 0) + int(c.get("output_tokens") or 0)
+    except (TypeError, ValueError):
+        return 0
 
-    Returns (total_usd, job_count). Scans in-memory jobs first; that's
-    typically enough since completed jobs stay in JOBS until restart.
+
+def _rolling_review_tokens_5h(exclude_job_id: str | None = None) -> tuple[int, float, int]:
+    """Sum Claude tokens (and USD, informational) across this server's reviews
+    completed in the last 5 hours — the review server's contribution to the
+    account's 5h Opus window. Coder AI sessions and other projects on the same
+    account stay invisible and must be added mentally.
+
+    Returns (total_tokens, total_usd, job_count).
     """
     import time as _time
-    if now is None:
-        now = _time.time()
-    horizon = now - 5 * 3600
-    total = 0.0
+    import datetime as _dt
+    horizon = _time.time() - 5 * 3600
+    tok = 0
+    usd = 0.0
     count = 0
-    with JOBS_LOCK:
-        snapshot = list(JOBS.items())
-    for jid, job in snapshot:
-        if exclude_job_id is not None and jid == exclude_job_id:
-            continue
+    # Scan persisted jobs (not just in-memory JOBS) so the rolling window
+    # survives a service restart — otherwise a restart silently resets the
+    # 5h total to zero and under-reports the window.
+    for job in _iter_jobs():
         if not isinstance(job, dict) or job.get("status") != "complete":
             continue
-        # completed_at is an ISO-8601 string ("YYYY-MM-DDTHH:MM:SSZ"); parse.
+        if exclude_job_id is not None and job.get("job_id") == exclude_job_id:
+            continue
         ct = job.get("completed_at") or ""
         try:
-            import datetime as _dt
             ts = _dt.datetime.fromisoformat(ct.replace("Z", "+00:00")).timestamp()
         except (ValueError, AttributeError):
             continue
         if ts < horizon:
             continue
-        claude_usd = ((job.get("result") or {}).get("usage") or {}).get("claude", {}).get("usd")
-        try:
-            total += float(claude_usd or 0)
-            if claude_usd:
-                count += 1
-        except (TypeError, ValueError):
-            continue
-    return round(total, 4), count
+        c = ((job.get("result") or {}).get("usage") or {}).get("claude") or {}
+        t = _claude_tokens(c)
+        if t:
+            tok += t
+            count += 1
+            try:
+                usd += float(c.get("usd") or 0)
+            except (TypeError, ValueError):
+                pass
+    return tok, round(usd, 4), count
 
 
-def _window_pct(claude_usd: float | int | None, job_id: str | None = None) -> dict | None:
-    """Compute this job's share of the user's 5h Opus subscription window,
-    plus the rolling 5h aggregate from this server.
+def _window_pct(claude_usage: dict | None, job_id: str | None = None) -> dict | None:
+    """This job's + rolling-5h share of the 5h Opus TOKEN budget.
 
-    Returns None when there's nothing meaningful to show (no Claude cost,
-    or budget disabled). Otherwise a dict the UI and Telegram notification
-    both render — single source of truth so the % matches everywhere.
+    Token-based, NOT dollar-based: the Max-plan 5h limit is metered by token
+    throughput, and total_cost_usd is cache-discounted (cache reads bill at 10%
+    in USD but still consume the window), so a USD estimate under-counts the
+    quota by ~6x in practice. We meter Claude tokens (input+output) against
+    OPUS_5H_TOKEN_BUDGET.
 
-    The rolling aggregate includes this job (when it's in JOBS) PLUS every
-    other review completed in the trailing 5h. The disclosure note makes
-    explicit that coder AI sessions and other-project Claude usage on the
-    same Anthropic account aren't counted — we can't see them.
+    Returns None when there's nothing to show. The rolling aggregate includes
+    this job PLUS every other review completed in the trailing 5h. Disclosure:
+    coder AI sessions and other-project Claude usage aren't counted.
     """
+    tokens = _claude_tokens(claude_usage)
+    if tokens <= 0 or OPUS_5H_TOKEN_BUDGET <= 0:
+        return None
+    other_tok, other_usd, other_count = _rolling_review_tokens_5h(exclude_job_id=job_id)
+    rolling_tok = tokens + other_tok
+    this_usd = 0.0
     try:
-        usd = float(claude_usd or 0)
+        this_usd = float((claude_usage or {}).get("usd") or 0)
     except (TypeError, ValueError):
-        return None
-    if usd <= 0 or OPUS_5H_BUDGET_USD <= 0:
-        return None
-    # Rolling 5h is computed from the in-memory job table. We pass the
-    # current job_id to dedupe — if this job is already in JOBS (the normal
-    # case at GET time), we add `usd` separately to avoid double-counting.
-    other_usd, other_count = _rolling_review_usd_5h(exclude_job_id=job_id)
-    rolling_usd = round(usd + other_usd, 4)
+        this_usd = 0.0
     return {
-        "claude_usd": round(usd, 4),
-        "budget_usd": OPUS_5H_BUDGET_USD,
+        "claude_tokens": tokens,
+        "budget_tokens": OPUS_5H_TOKEN_BUDGET,
         "plan_label": OPUS_PLAN_LABEL,
-        "pct": round(usd / OPUS_5H_BUDGET_USD * 100, 2),
-        "rolling_5h_usd": rolling_usd,
-        "rolling_5h_pct": round(rolling_usd / OPUS_5H_BUDGET_USD * 100, 2),
+        "pct": round(tokens / OPUS_5H_TOKEN_BUDGET * 100, 2),
+        "rolling_5h_tokens": rolling_tok,
+        "rolling_5h_pct": round(rolling_tok / OPUS_5H_TOKEN_BUDGET * 100, 2),
         "rolling_5h_job_count": other_count + 1,
+        "claude_usd": round(this_usd, 4),  # informational only; not the % basis
         "note": (
-            "Rolling 5h reflects ONLY this review server's contribution. "
-            "Coder AI sessions, claude.ai chats, and other projects on the "
-            "same Anthropic account aren't counted — add them mentally."
+            "Token-metered against the 5h Opus budget (the Max-plan limit is "
+            "token-based; USD is cache-discounted and under-counts). Rolling 5h "
+            "reflects ONLY this review server's Claude tokens — coder AI "
+            "sessions, claude.ai, and other projects on the same account aren't "
+            "counted; add them mentally."
         ),
     }
 
@@ -229,8 +245,7 @@ def _notify_job_done(job_id: str) -> None:
         usage = result.get("usage") or {}
         tin = usage.get("total_input_tokens") or 0
         tout = usage.get("total_output_tokens") or 0
-        claude_usd = (usage.get("claude") or {}).get("usd")
-        w = _window_pct(claude_usd, job_id=job_id)
+        w = _window_pct(usage.get("claude") or {}, job_id=job_id)
         # Only show reviewers that actually ran (Claude-only reviews omit Codex).
         ran = result.get("reviewers") or ["claude", "codex"]
         lines = [f"Review COMPLETE — {pf}"]
@@ -1339,10 +1354,7 @@ def _lean_result(result: dict, job_id: str) -> dict:
     # Surface "this job consumed X% of your 5h Opus window" plus a rolling
     # 5h aggregate from this server — clearly disclosed as NOT including
     # coder AI sessions or other-project Claude usage on the same account.
-    w = _window_pct(
-        ((out.get("usage") or {}).get("claude") or {}).get("usd"),
-        job_id=job_id,
-    )
+    w = _window_pct((out.get("usage") or {}).get("claude") or {}, job_id=job_id)
     if w is not None:
         out["subscription_window"] = w
 
@@ -1386,10 +1398,7 @@ def get_review(job_id: str, full: bool = False):
         # subscription_window field so UI + consumers don't have to compute
         # it themselves regardless of which endpoint flavor they fetched.
         if isinstance(result, dict):
-            w = _window_pct(
-                ((result.get("usage") or {}).get("claude") or {}).get("usd"),
-                job_id=job_id,
-            )
+            w = _window_pct((result.get("usage") or {}).get("claude") or {}, job_id=job_id)
             if w is not None:
                 result = dict(result)
                 result["subscription_window"] = w

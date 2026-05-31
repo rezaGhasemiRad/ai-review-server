@@ -688,6 +688,7 @@ async function loadDetail(){
     const sw = r.subscription_window;
     let swRow = '';
     if(sw){
+      const budgetTok = sw.budget_tokens ? (sw.budget_tokens/1e6).toFixed(2)+'M tok' : '';
       swRow =
         '<div style="margin-top:6px;padding-top:6px;border-top:1px dashed var(--line)" '+
             'title="'+esc(sw.note||'')+'">'+
@@ -695,8 +696,8 @@ async function loadDetail(){
           sw.rolling_5h_pct.toFixed(1)+'% in last 5h '+
           '<span class="muted">('+sw.rolling_5h_job_count+' review'+
             (sw.rolling_5h_job_count===1?'':'s')+', '+
-            esc(sw.plan_label)+' $'+(sw.budget_usd).toFixed(0)+
-            ' budget — excludes coder AI &amp; other-project usage)</span>'+
+            esc(sw.plan_label)+' '+budgetTok+
+            ' 5h Opus budget · token-metered — excludes coder AI &amp; other usage)</span>'+
         '</div>';
     }
     h += '<div style="margin-top:10px;padding:8px 10px;background:#f8f9fb;'+
