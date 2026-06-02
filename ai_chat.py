@@ -495,6 +495,46 @@ def _findings_from_block(block: dict | None) -> list:
     return []
 
 
+# Reconcile is skipped (saving a full second Claude pass) when the two
+# reviewers' verdicts match AND their findings overlap at least this much —
+# i.e. they already agree, so there's nothing to reconcile. Jaccard over
+# (file, severity) keys. Tunable but conservative: at/above this, the
+# disagreement-resolution value of reconcile is near zero.
+RECONCILE_SKIP_CONCORDANCE = 0.5
+
+
+def _finding_concordance(claude_findings: list, codex_findings: list) -> float:
+    """How much the two reviewers' findings overlap, 0..1 (Jaccard over
+    (file-or-'<general>', severity) keys).
+
+    1.0  = both found nothing, OR identical (file,severity) sets.
+    0.0  = one found issues and the other found none (genuine divergence),
+           or no shared keys at all.
+    Coarse on purpose: it answers "do the reviewers broadly agree on WHERE
+    and HOW SERIOUS the problems are?", which is exactly what decides whether
+    a reconcile pass can add anything.
+    """
+    def keys(findings: list) -> set:
+        out = set()
+        for f in findings or []:
+            if not isinstance(f, dict):
+                continue
+            path = f.get("file")
+            path = path.strip() if isinstance(path, str) and path.strip() else "<general>"
+            sev = str(f.get("severity") or "?").lower()
+            out.add((path, sev))
+        return out
+
+    kc, kx = keys(claude_findings), keys(codex_findings)
+    if not kc and not kx:
+        return 1.0          # both clean → fully concordant
+    if not kc or not kx:
+        return 0.0          # one flagged, the other didn't → reconcile
+    inter = len(kc & kx)
+    union = len(kc | kx)
+    return inter / union if union else 1.0
+
+
 def _verdict_from_block_or_text(block: dict | None, review_md: str) -> str | None:
     if isinstance(block, dict) and block.get("verdict"):
         return str(block["verdict"]).lower()
@@ -1291,12 +1331,28 @@ def _run_review_pipeline(
         (tr or {}).get("status") not in ("passed", "skipped", None)
         for tr in (test_results_by_repo or {}).values()
     )
+    # Reconcile-skip decision. Reconcile's only job is to resolve
+    # DISAGREEMENTS between the two reviewers. When they already agree there's
+    # nothing to reconcile, so we drop the second (expensive) Claude pass.
+    # "Agree" = matching verdicts AND high finding concordance, with no
+    # unflagged test failures to surface. This subsumes the old both-approve-
+    # clean case (empty findings → concordance 1.0).
+    verdicts_match = (
+        claude_verdict_p1 is not None and claude_verdict_p1 == codex_verdict_p1
+    )
+    concordance = _finding_concordance(claude_findings_p1, codex_findings_p1)
     both_clean = (
         claude_verdict_p1 == "approve"
         and codex_verdict_p1 == "approve"
         and not claude_findings_p1
         and not codex_findings_p1
         and not test_failures
+    )
+    high_concordance_skip = (
+        not single_reviewer
+        and verdicts_match
+        and not test_failures
+        and concordance >= RECONCILE_SKIP_CONCORDANCE
     )
     if single_reviewer:
         # One reviewer — its phase-1 review IS the final review. There's no
@@ -1318,18 +1374,29 @@ def _run_review_pipeline(
         if run_codex:
             history.append({"speaker": "codex (final)", "text": codex_reconcile})
         cb("finalizing")
-    elif both_clean:
-        info("phase 2/2 — skipped (both reviewers approved with no findings, "
-             "no test failures)")
-        cb("phase 2/2 · skipped (clean review)")
-        skip_note = (
-            "Reconcile skipped — both reviewers returned `approve` with no "
-            "findings, and Tier-1 tests passed in every repo. There were no "
-            "disagreements or unflagged blockers to resolve."
-        )
+    elif high_concordance_skip:
+        pct = round(concordance * 100)
+        if both_clean:
+            info("phase 2/2 — skipped (both approved, no findings, tests clean)")
+            cb("phase 2/2 · skipped (clean review)")
+            skip_note = (
+                "Reconcile skipped — both reviewers returned `approve` with no "
+                "findings and Tier-1 tests passed. Nothing to reconcile."
+            )
+        else:
+            info(f"phase 2/2 — skipped (reviewers concur: verdict "
+                 f"'{claude_verdict_p1}', {pct}% finding overlap)")
+            cb("phase 2/2 · skipped (reviewers concur)")
+            skip_note = (
+                f"Reconcile skipped — both reviewers independently reached the "
+                f"same verdict (`{claude_verdict_p1}`) with {pct}% finding "
+                f"overlap (file+severity). They agree on where and how serious "
+                f"the issues are, so there was no disagreement to reconcile. "
+                f"Both reviews' findings stand as-is; dedupe them downstream."
+            )
         claude_reconcile = skip_note
         codex_reconcile = skip_note
-        # No findings → no peer to assess.
+        # No reconcile pass → no model-generated peer assessment.
         claude_peer_assessment: list = []
         codex_peer_assessment: list = []
         history.append({"speaker": "claude (reconcile)", "text": claude_reconcile})
