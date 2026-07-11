@@ -33,3 +33,44 @@ class Slice:
     def __post_init__(self) -> None:
         self.symbols = set(self.symbols)
         self.files = set(self.files)
+
+
+@dataclasses.dataclass
+class DiffFile:
+    path: str
+    text: str = ""
+    changed_ranges: list[tuple[int, int]] = dataclasses.field(default_factory=list)
+
+    @property
+    def char_count(self) -> int:
+        return len(self.text)
+
+
+_DIFF_GIT = re.compile(r"^diff --git a/(?P<a>.+?) b/(?P<b>.+?)\s*$")
+_HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(?P<start>\d+)(?:,(?P<len>\d+))? @@")
+
+
+def parse_unified_diff(diff_text: str) -> dict[str, DiffFile]:
+    """Parse `git diff` output into {new_path: DiffFile}. changed_ranges are
+    new-file line spans (start, start+len-1) from each hunk header; text is the
+    raw per-file diff block (used for size measurement)."""
+    files: dict[str, DiffFile] = {}
+    current: DiffFile | None = None
+    for line in diff_text.splitlines(keepends=True):
+        m = _DIFF_GIT.match(line.rstrip("\n"))
+        if m:
+            path = m.group("b")
+            current = DiffFile(path=path)
+            files[path] = current
+            current.text += line
+            continue
+        if current is None:
+            continue
+        current.text += line
+        h = _HUNK.match(line.rstrip("\n"))
+        if h:
+            start = int(h.group("start"))
+            length = int(h.group("len") or "1")
+            end = start + max(length, 1) - 1
+            current.changed_ranges.append((start, end))
+    return files

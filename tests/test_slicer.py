@@ -87,3 +87,34 @@ def test_slice_dataclass_normalizes_collections():
                      symbols=["MoveQuestions"], files=["a.cs"])
     assert s.symbols == {"MoveQuestions"}
     assert s.files == {"a.cs"}
+
+
+DIFF = """diff --git a/Services/QuestionService.cs b/Services/QuestionService.cs
+index 111..222 100644
+--- a/Services/QuestionService.cs
++++ b/Services/QuestionService.cs
+@@ -12,3 +12,5 @@ public class QuestionService
+ existing line
++added line one
++added line two
+ tail line
+diff --git a/Repositories/QuestionRepository.cs b/Repositories/QuestionRepository.cs
+index 333..444 100644
+--- a/Repositories/QuestionRepository.cs
++++ b/Repositories/QuestionRepository.cs
+@@ -20,0 +21,2 @@ public class QuestionRepository
++new repo line
++another repo line
+"""
+
+
+def test_parse_unified_diff_extracts_files_ranges_and_text():
+    parsed = slicer.parse_unified_diff(DIFF)
+    assert set(parsed) == {"Services/QuestionService.cs",
+                           "Repositories/QuestionRepository.cs"}
+    svc = parsed["Services/QuestionService.cs"]
+    # New-file hunk starts at 12, spans 5 lines -> [12, 16]
+    assert svc.changed_ranges == [(12, 16)]
+    assert svc.char_count == len(svc.text) > 0
+    repo = parsed["Repositories/QuestionRepository.cs"]
+    assert repo.changed_ranges == [(21, 22)]
