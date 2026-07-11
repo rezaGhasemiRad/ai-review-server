@@ -174,6 +174,42 @@ def build_slice(graph: dict, root: str, root_type: str | None = None) -> Slice:
                  symbols=seen, files=files)
 
 
+def slice_char_size(slc: Slice, diff_files: dict[str, DiffFile]) -> int:
+    """Review-payload size proxy: total diff chars of the slice's changed
+    files (files that are both in the slice and in the diff)."""
+    return sum(diff_files[p].char_count for p in slc.files if p in diff_files)
+
+
+def sub_split(graph: dict, slc: Slice, diff_files: dict[str, DiffFile],
+              cap: int = MAX_REVIEW_CHARS) -> list[Slice]:
+    """If `slc` exceeds `cap`, re-root on the root's direct callees (one level
+    down) and recurse. A `residual` slice keeps the root + any symbols not
+    pulled into a child subtree, so coverage of the parent's symbols is fully
+    preserved. Returns slices that each fit under `cap` (except a single symbol
+    whose own diff exceeds the cap — a Phase 2 fallback decides what to do)."""
+    if slice_char_size(slc, diff_files) <= cap:
+        return [slc]
+    children = sorted(callees(graph, slc.root))
+    if not children:
+        return [slc]  # single symbol over cap; caller decides fallback (Phase 2)
+
+    child_slices = [build_slice(graph, c) for c in children]
+    covered_by_children: set[str] = set().union(*(cs.symbols for cs in child_slices))
+
+    out: list[Slice] = []
+    # Residual: the root and anything not reachable through a child subtree.
+    residual_syms = slc.symbols - covered_by_children
+    if residual_syms:
+        residual_files: set[str] = set()
+        for s in residual_syms:
+            residual_files |= _def_files(graph, s)
+        out.append(Slice(root=slc.root, root_type=slc.root_type,
+                        symbols=residual_syms, files=residual_files))
+    for cs in child_slices:
+        out.extend(sub_split(graph, cs, diff_files, cap))
+    return out
+
+
 def _root_of(graph: dict, symbol: str, _seen: set[str] | None = None) -> set[str]:
     """Walk up to the framework-invoked root(s) that can reach `symbol`.
     Returns the set of roots (usually one; multiple if shared code)."""
@@ -190,17 +226,21 @@ def _root_of(graph: dict, symbol: str, _seen: set[str] | None = None) -> set[str
     return roots
 
 
-def slice_feature(graph: dict, diff_files: dict[str, DiffFile]) -> list[Slice]:
+def slice_feature(graph: dict, diff_files: dict[str, DiffFile],
+                  cap: int = MAX_REVIEW_CHARS) -> list[Slice]:
     """Turn a parsed diff into vertical slices. Every changed symbol is covered
-    by at least one slice (via its root, or as its own orphan slice)."""
+    by at least one slice (via its root, or as its own orphan slice). Slices
+    over `cap` are sub-split by sub-root."""
     changed = changed_symbols(graph, {p: d.changed_ranges for p, d in diff_files.items()})
 
-    # 1. Roots that reach at least one changed symbol.
+    # 1. Roots that reach at least one changed symbol; sub-split any over cap.
     roots: set[str] = set()
     for sym in changed:
         roots |= _root_of(graph, sym)
 
-    slices = [build_slice(graph, r) for r in sorted(roots)]
+    slices: list[Slice] = []
+    for r in sorted(roots):
+        slices.extend(sub_split(graph, build_slice(graph, r), diff_files, cap))
 
     # 2. Orphan sweep: any changed symbol not covered by a root slice becomes
     #    its own slice (defensive — _root_of already returns the symbol itself

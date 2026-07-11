@@ -712,16 +712,30 @@ def slice_char_size(slc: Slice, diff_files: dict[str, "DiffFile"]) -> int:
 def sub_split(graph: dict, slc: Slice, diff_files: dict[str, "DiffFile"],
               cap: int = MAX_REVIEW_CHARS) -> list[Slice]:
     """If `slc` exceeds `cap`, re-root on the root's direct callees (one level
-    down) and recurse. Returns slices that each fit under `cap`. Coverage of
-    the parent's changed symbols is preserved."""
+    down) and recurse. A `residual` slice keeps the root + any symbols not
+    pulled into a child subtree, so coverage of the parent's symbols is fully
+    preserved. Returns slices that each fit under `cap` (except a single symbol
+    whose own diff exceeds the cap — a Phase 2 fallback decides what to do)."""
     if slice_char_size(slc, diff_files) <= cap:
         return [slc]
     children = sorted(callees(graph, slc.root))
     if not children:
-        return [slc]  # cannot split further; caller decides fallback (Phase 2)
+        return [slc]  # single symbol over cap; caller decides fallback (Phase 2)
+
+    child_slices = [build_slice(graph, c) for c in children]
+    covered_by_children: set[str] = set().union(*(cs.symbols for cs in child_slices))
+
     out: list[Slice] = []
-    for child in children:
-        out.extend(sub_split(graph, build_slice(graph, child), diff_files, cap))
+    # Residual: the root and anything not reachable through a child subtree.
+    residual_syms = slc.symbols - covered_by_children
+    if residual_syms:
+        residual_files: set[str] = set()
+        for s in residual_syms:
+            residual_files |= _def_files(graph, s)
+        out.append(Slice(root=slc.root, root_type=slc.root_type,
+                        symbols=residual_syms, files=residual_files))
+    for cs in child_slices:
+        out.extend(sub_split(graph, cs, diff_files, cap))
     return out
 ```
 

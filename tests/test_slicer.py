@@ -215,3 +215,53 @@ def test_slice_feature_orphan_when_caller_not_changed(graph):
     slices = slicer.slice_feature(graph, diff_files)
     covered = set().union(*(s.symbols for s in slices))
     assert "MoveQuestionsCategoryAsync" in covered
+
+
+def test_slice_char_size_sums_changed_file_diffs(graph):
+    diff_files = {
+        "Services/QuestionService.cs": slicer.DiffFile(
+            "Services/QuestionService.cs", text="a" * 300, changed_ranges=[(22, 23)]),
+        "Controllers/AdminQuestionController.cs": slicer.DiffFile(
+            "Controllers/AdminQuestionController.cs", text="b" * 200, changed_ranges=[(15, 15)]),
+    }
+    s = slicer.build_slice(graph, "MoveQuestions")
+    # Only files present in BOTH the slice and the diff count.
+    assert slicer.slice_char_size(s, diff_files) == 500
+
+
+def test_sub_split_descends_when_over_cap(graph):
+    big = {
+        "Controllers/AdminQuestionController.cs": slicer.DiffFile(
+            "Controllers/AdminQuestionController.cs", text="c" * 10, changed_ranges=[(15, 15)]),
+        "Services/QuestionService.cs": slicer.DiffFile(
+            "Services/QuestionService.cs", text="c" * 100, changed_ranges=[(22, 22)]),
+        "Repositories/QuestionRepository.cs": slicer.DiffFile(
+            "Repositories/QuestionRepository.cs", text="c" * 100, changed_ranges=[(21, 21)]),
+    }
+    parent = slicer.build_slice(graph, "MoveQuestions")
+    # Force a split with a tiny cap.
+    parts = slicer.sub_split(graph, parent, big, cap=150)
+    # Descends to the root's callees as new sub-roots.
+    assert len(parts) >= 2
+    for p in parts:
+        assert slicer.slice_char_size(p, big) <= 150
+    # Coverage preserved across the split.
+    assert set().union(*(p.symbols for p in parts)) >= {
+        "MoveQuestionsToCategoryAsync", "GetCategoryByIdAsync", "MoveQuestionsCategoryAsync"}
+
+
+def test_slice_feature_respects_cap(graph):
+    diff_files = {
+        "Controllers/AdminQuestionController.cs": slicer.DiffFile(
+            "Controllers/AdminQuestionController.cs", text="c" * 10, changed_ranges=[(15, 15)]),
+        "Services/QuestionService.cs": slicer.DiffFile(
+            "Services/QuestionService.cs", text="c" * 100, changed_ranges=[(22, 22)]),
+        "Repositories/QuestionRepository.cs": slicer.DiffFile(
+            "Repositories/QuestionRepository.cs", text="c" * 100, changed_ranges=[(21, 21)]),
+    }
+    slices = slicer.slice_feature(graph, diff_files, cap=150)
+    for s in slices:
+        assert slicer.slice_char_size(s, diff_files) <= 150
+    covered = set().union(*(s.symbols for s in slices))
+    changed = slicer.changed_symbols(graph, {p: d.changed_ranges for p, d in diff_files.items()})
+    assert changed <= covered
