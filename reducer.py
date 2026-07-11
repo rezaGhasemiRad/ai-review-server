@@ -18,9 +18,12 @@ def fingerprint(repo: str, finding: dict) -> str:
     """Readable, stable identity slug. Keys on repo + enclosing symbol (or file
     basename) + category + a short hash of the normalized title. Excludes line
     number and model on purpose."""
-    symbol = finding.get("symbol") or (finding.get("file", "").rsplit("/", 1)[-1])
+    # Fields can be present-but-null (e.g. a file-less "no test coverage"
+    # finding), so coerce with `or ""` — .get(k, "") does NOT help when the
+    # value is None.
+    symbol = finding.get("symbol") or (finding.get("file") or "").rsplit("/", 1)[-1] or "unknown"
     category = finding.get("category") or "general"
-    h = hashlib.sha1(_norm(finding.get("title", "")).encode("utf-8")).hexdigest()[:4]
+    h = hashlib.sha1(_norm(finding.get("title") or "").encode("utf-8")).hexdigest()[:4]
     return f"{repo}:{symbol}:{category}#{h}"
 
 
