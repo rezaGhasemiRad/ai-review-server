@@ -33,3 +33,28 @@ def test_card_for_generates_once_then_serves_cache(tmp_path):
     cc.card_for(store, symbol="GetCategoryByIdAsync", signature="x", source="y",
                 mtime=100.0, generate_fn=fake_llm)
     assert calls["n"] == 1
+
+
+def _graph_with_def():
+    d = {"name": "GetCategoryByIdAsync", "file": "Repositories/QuestionRepository.cs",
+         "line_start": 10, "line_end": 15, "signature": "Task<Category?> GetCategoryByIdAsync(Guid id)",
+         "enclosing_class": "QuestionRepository"}
+    return {"symbol_index": {"GetCategoryByIdAsync": {"defs": [d], "refs": []}}}
+
+
+def test_cards_for_symbols_and_render(tmp_path, monkeypatch):
+    graph = _graph_with_def()
+    store = cc.CardStore(cache_path=str(tmp_path / "c.json"))
+
+    # Stub source + mtime resolution (no real git/fs).
+    monkeypatch.setattr(cc, "_source_and_mtime",
+                        lambda repo, ref, file, ls, le: ("SRC", 100.0))
+    gen = lambda s, sig, src: {"returns": "Category or null", "null_behavior": "null when missing",
+                               "throws": "none", "side_effects": "none"}
+
+    cards = cc.cards_for_symbols(store, "/repo", "REF", graph,
+                                 {"GetCategoryByIdAsync"}, generate_fn=gen)
+    assert "GetCategoryByIdAsync" in cards
+    md = cc.render_cards_md(cards)
+    assert "GetCategoryByIdAsync" in md and "null when missing" in md
+    assert md.startswith("### Seam contracts")

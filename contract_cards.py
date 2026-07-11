@@ -74,3 +74,44 @@ def card_for(store: "CardStore", symbol: str, signature: str, source: str,
     card = generate_fn(symbol, signature, source)
     store.put(symbol, mtime, card)
     return card
+
+
+def _source_and_mtime(repo: str, ref: str, file: str, ls: int, le: int) -> tuple[str, float]:
+    """Method source (line range at `ref`) and a change key. Uses the file's
+    last-commit epoch at `ref` as the mtime proxy (stable across clones,
+    unlike filesystem mtime)."""
+    blob = subprocess.run(["git", "-C", repo, "show", f"{ref}:{file}"],
+                          capture_output=True, text=True, encoding="utf-8")
+    lines = blob.stdout.splitlines()
+    src = "\n".join(lines[max(ls - 1, 0):le])
+    ts = subprocess.run(["git", "-C", repo, "log", "-1", "--format=%ct", ref, "--", file],
+                        capture_output=True, text=True, encoding="utf-8")
+    mtime = float(ts.stdout.strip() or 0)
+    return src, mtime
+
+
+def cards_for_symbols(store: CardStore, repo: str, ref: str, graph: dict,
+                      symbols: set[str], generate_fn=default_generate) -> dict[str, dict]:
+    out: dict[str, dict] = {}
+    idx = graph.get("symbol_index") or {}
+    for sym in sorted(symbols):
+        defs = (idx.get(sym) or {}).get("defs") or []
+        if not defs:
+            continue
+        d = defs[0]
+        src, mtime = _source_and_mtime(repo, ref, d["file"], d["line_start"], d["line_end"])
+        out[sym] = card_for(store, sym, d.get("signature", ""), src, mtime, generate_fn)
+    return out
+
+
+def render_cards_md(cards: dict[str, dict]) -> str:
+    if not cards:
+        return ""
+    lines = ["### Seam contracts (callees on the boundary of this slice)", ""]
+    for sym in sorted(cards):
+        c = cards[sym]
+        lines.append(f"- **{sym}** — returns: {c.get('returns', 'unknown')}; "
+                     f"null: {c.get('null_behavior', 'unknown')}; "
+                     f"throws: {c.get('throws', 'unknown')}; "
+                     f"side effects: {c.get('side_effects', 'unknown')}")
+    return "\n".join(lines)
