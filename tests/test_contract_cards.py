@@ -12,3 +12,24 @@ def test_cache_roundtrip_and_staleness(tmp_path):
     assert reloaded.get("Foo", mtime=100.0) == {"returns": "null when not found"}
     # Stale when the source file's mtime moved on.
     assert reloaded.get("Foo", mtime=200.0) is None
+
+
+def test_card_for_generates_once_then_serves_cache(tmp_path):
+    calls = {"n": 0}
+
+    def fake_llm(symbol, signature, source):
+        calls["n"] += 1
+        return {"returns": "Category or null", "null_behavior": "null when missing",
+                "throws": "none", "side_effects": "none"}
+
+    store = cc.CardStore(cache_path=str(tmp_path / "c.json"))
+    card1 = cc.card_for(store, symbol="GetCategoryByIdAsync",
+                        signature="Task<Category?> GetCategoryByIdAsync(Guid id)",
+                        source="public async Task<Category?> ... { return await ...; }",
+                        mtime=100.0, generate_fn=fake_llm)
+    assert card1["null_behavior"] == "null when missing"
+    assert calls["n"] == 1
+    # Second call with same mtime -> served from cache, no re-generation.
+    cc.card_for(store, symbol="GetCategoryByIdAsync", signature="x", source="y",
+                mtime=100.0, generate_fn=fake_llm)
+    assert calls["n"] == 1
