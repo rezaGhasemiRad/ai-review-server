@@ -2229,17 +2229,19 @@ def review_branch_sliced_structured(repo, branch, base="main", *,
     card_store.save()   # persist any cards generated this run
     reduced = reducer.reduce(label, slice_results)
 
-    # Adversarial verification (Phase 4): refute low-confidence findings.
-    _before = len(reduced["findings"])
+    # Adversarial verification (Phase 4): annotate + down-rank low-confidence
+    # findings. NON-DESTRUCTIVE — nothing is dropped (a refuter can be wrong).
     reduced["findings"] = verify.verify_findings(reduced["findings"])
-    reduced["verification"] = {"kept": len(reduced["findings"]),
-                               "dropped": _before - len(reduced["findings"])}
-    # Resync per-model columns with the verified set (UI/API back-compat).
+    vc: dict[str, int] = {}
+    for f in reduced["findings"]:
+        s = f.get("verified", "unverified")
+        vc[s] = vc.get(s, 0) + 1
+    reduced["verification"] = vc
+    # Resync per-model columns (UI/API back-compat).
     reduced["claude_findings"] = [f for f in reduced["findings"] if "claude" in f.get("found_by", [])]
     reduced["codex_findings"] = [f for f in reduced["findings"] if "codex" in f.get("found_by", [])]
     if progress_cb:
-        progress_cb(f"verification: kept {reduced['verification']['kept']}, "
-                    f"dropped {reduced['verification']['dropped']}")
+        progress_cb("verification: " + ", ".join(f"{k}={v}" for k, v in sorted(vc.items())))
 
     if prior_result:
         reduced["iteration"] = reducer.iteration_diff(reduced, prior_result)

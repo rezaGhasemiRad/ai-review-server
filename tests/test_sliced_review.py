@@ -147,5 +147,4 @@ def test_sliced_review_runs_interslice_and_verify(monkeypatch, tmp_path):
         repo="/x", branch="develop", base="main", review_fn=rv, pack_target=1)
     cats = [f.get("category") for f in out["findings"]]
     assert "seam" in cats
-    assert out.get("verification") is not None
-    assert out["verification"]["kept"] == len(out["findings"])
+    assert isinstance(out.get("verification"), dict) and out["verification"]
