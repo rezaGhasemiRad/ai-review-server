@@ -134,3 +134,21 @@ def test_changed_symbols_multiple_files_and_defs(graph):
     }
     assert slicer.changed_symbols(graph, changed) == {
         "GetCategoryByIdAsync", "MoveQuestionsCategoryAsync", "Slugify"}
+
+
+def test_callees_finds_downstream_symbols(graph):
+    assert slicer.callees(graph, "MoveQuestionsToCategoryAsync") == {
+        "GetCategoryByIdAsync", "MoveQuestionsCategoryAsync"}
+    assert slicer.callees(graph, "BulkInsert") == set()  # leaf
+
+
+def test_callers_finds_upstream_symbols(graph):
+    assert slicer.callers(graph, "MoveQuestionsToCategoryAsync") == {"MoveQuestions"}
+    assert slicer.callers(graph, "MoveQuestions") == set()  # framework-invoked
+
+
+def test_is_root_true_for_framework_invoked(graph):
+    assert slicer.is_root(graph, "MoveQuestions") is True      # endpoint
+    assert slicer.is_root(graph, "ExecuteAsync") is True       # job
+    assert slicer.is_root(graph, "Slugify") is True            # orphan (no callers)
+    assert slicer.is_root(graph, "MoveQuestionsToCategoryAsync") is False

@@ -94,3 +94,37 @@ def changed_symbols(graph: dict, changed: dict[str, list[tuple[int, int]]]) -> s
             if any(_overlaps(span, rng) for rng in ranges):
                 out.add(de["name"])
     return out
+
+
+def _has_def(graph: dict, name: str) -> bool:
+    entry = (graph.get("symbol_index") or {}).get(name)
+    return bool(entry and entry.get("defs"))
+
+
+def callees(graph: dict, symbol: str) -> set[str]:
+    """In-repo symbols called from within `symbol`'s body. A callee is any
+    defined symbol S that has a ref whose enclosing_function_name == symbol."""
+    out: set[str] = set()
+    for name, entry in (graph.get("symbol_index") or {}).items():
+        if name == symbol or not entry.get("defs"):
+            continue
+        if any(r.get("enclosing_function_name") == symbol for r in entry.get("refs", [])):
+            out.add(name)
+    return out
+
+
+def callers(graph: dict, symbol: str) -> set[str]:
+    """In-repo functions that call `symbol` (defined enclosing functions of its
+    refs)."""
+    out: set[str] = set()
+    entry = (graph.get("symbol_index") or {}).get(symbol) or {}
+    for r in entry.get("refs", []):
+        caller = r.get("enclosing_function_name")
+        if caller and _has_def(graph, caller):
+            out.add(caller)
+    return out
+
+
+def is_root(graph: dict, symbol: str) -> bool:
+    """A symbol with no in-repo callers (framework/runtime-invoked, or orphan)."""
+    return len(callers(graph, symbol)) == 0
