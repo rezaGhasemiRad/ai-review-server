@@ -54,6 +54,13 @@ def test_reduce_dedups_and_records_provenance_and_rolls_up_verdict():
     assert guid[0]["confidence"] == "high"        # both models
     # Ranked: high-confidence first.
     assert out["findings"][0]["category"] == "null-handling"
+    # Back-compat: per-model columns for the UI. The shared bug (both models)
+    # appears in both; the codex-only "missing tests" only in codex.
+    assert out["reviewers"] == ["claude", "codex"]
+    assert any(f["category"] == "null-handling" for f in out["claude_findings"])
+    assert any(f["category"] == "null-handling" for f in out["codex_findings"])
+    assert any(f["category"] == "test-coverage" for f in out["codex_findings"])
+    assert not any(f["category"] == "test-coverage" for f in out["claude_findings"])
 
 
 def test_iteration_diff_classifies_by_fingerprint():
