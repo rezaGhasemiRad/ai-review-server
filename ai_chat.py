@@ -2125,6 +2125,8 @@ def review_branch_sliced_structured(repo, branch, base="main", *,
     import reducer
     import ledger as _ledger
     import contract_cards
+    import interslice
+    import verify
 
     review_fn = review_fn or review_branch_structured
     label = repo_label or repo.rsplit("/", 1)[-1]
@@ -2192,8 +2194,33 @@ def review_branch_sliced_structured(repo, branch, base="main", *,
             "codex_findings": r.get("codex_findings") or [],
         })
 
+    # Inter-slice seam pass (Phase 4): review each cross-slice cut edge against
+    # the callee's contract card; fold findings in as a synthetic slice.
+    all_seam_syms = set().union(*seams_by_slice.values()) if seams_by_slice else set()
+    seam_cards = (contract_cards.cards_for_symbols(card_store, repo, rng["end"], graph, all_seam_syms)
+                  if all_seam_syms else {})
+    inter = interslice.review_seam_edges(seams_by_slice, seam_cards)
+    if inter:
+        if progress_cb:
+            progress_cb(f"inter-slice seam pass: {len(inter)} finding(s) across seam edges")
+        slice_results.append({"slice": "inter-slice", "verdict": "comment",
+                              "claude_findings": inter, "codex_findings": []})
+
     card_store.save()   # persist any cards generated this run
     reduced = reducer.reduce(label, slice_results)
+
+    # Adversarial verification (Phase 4): refute low-confidence findings.
+    _before = len(reduced["findings"])
+    reduced["findings"] = verify.verify_findings(reduced["findings"])
+    reduced["verification"] = {"kept": len(reduced["findings"]),
+                               "dropped": _before - len(reduced["findings"])}
+    # Resync per-model columns with the verified set (UI/API back-compat).
+    reduced["claude_findings"] = [f for f in reduced["findings"] if "claude" in f.get("found_by", [])]
+    reduced["codex_findings"] = [f for f in reduced["findings"] if "codex" in f.get("found_by", [])]
+    if progress_cb:
+        progress_cb(f"verification: kept {reduced['verification']['kept']}, "
+                    f"dropped {reduced['verification']['dropped']}")
+
     if prior_result:
         reduced["iteration"] = reducer.iteration_diff(reduced, prior_result)
     reduced["slice_count"] = len(packed)
