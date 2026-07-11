@@ -23,17 +23,25 @@ def _refute_default(finding: dict, i: int) -> bool:
 
 def verify_findings(findings: list[dict], refute_fn=_refute_default,
                     passes: int = 3) -> list[dict]:
-    """Return the findings that survive. High-confidence findings pass through
-    (annotated verified='by-agreement'). Low-confidence findings are refuted
-    `passes` times and kept only if refutations are a minority."""
+    """Annotate every finding with a verification status and DOWN-RANK the
+    contested ones — never drop. Silently deleting a finding risks discarding a
+    true positive (the refuter can be wrong, especially without full context),
+    which is worse than surfacing a low-priority note. Statuses:
+
+      by-agreement       — both models flagged it (high confidence); not refuted
+      survived-refutation — single-model, refutations a minority
+      contested          — single-model, majority refuted (kept, ranked last)
+
+    Contested findings are pushed to the end (stable sort preserves the
+    reducer's ordering within each group)."""
     majority = passes // 2 + 1
-    kept: list[dict] = []
+    out: list[dict] = []
     for f in findings:
         if f.get("confidence") == "high":
-            kept.append({**f, "verified": "by-agreement", "refute_votes": 0})
+            out.append({**f, "verified": "by-agreement", "refute_votes": 0})
             continue
         votes = sum(1 for i in range(passes) if refute_fn(f, i))
-        if votes < majority:
-            kept.append({**f, "verified": "survived-refutation", "refute_votes": votes})
-        # else: dropped (majority refuted)
-    return kept
+        status = "contested" if votes >= majority else "survived-refutation"
+        out.append({**f, "verified": status, "refute_votes": votes})
+    out.sort(key=lambda f: 1 if f.get("verified") == "contested" else 0)
+    return out
