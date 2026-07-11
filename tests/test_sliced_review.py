@@ -41,7 +41,7 @@ DIFF = ("diff --git a/Services/QuestionService.cs b/Services/QuestionService.cs\
 def test_sliced_review_dispatches_per_slice_and_reduces(monkeypatch):
     monkeypatch.setattr(ai_chat, "_build_graph_at_branch", lambda repo, branch: _two_slice_graph())
     monkeypatch.setattr(ai_chat, "_feature_diff_text",
-                        lambda repo, branch, base, only_globs=None: DIFF)
+                        lambda repo, branch, base, only_globs=None, diff_spec=None: DIFF)
 
     out = ai_chat.review_branch_sliced_structured(
         repo="/x", branch="origin/develop", base="origin/main",
@@ -57,7 +57,7 @@ def test_sliced_review_dispatches_per_slice_and_reduces(monkeypatch):
 def test_sliced_review_iteration_diff_when_prior_given(monkeypatch):
     monkeypatch.setattr(ai_chat, "_build_graph_at_branch", lambda repo, branch: _two_slice_graph())
     monkeypatch.setattr(ai_chat, "_feature_diff_text",
-                        lambda repo, branch, base, only_globs=None: DIFF)
+                        lambda repo, branch, base, only_globs=None, diff_spec=None: DIFF)
     first = ai_chat.review_branch_sliced_structured(
         repo="/x", branch="b", base="c", review_fn=_fake_review, pack_target=1)
     second = ai_chat.review_branch_sliced_structured(
@@ -67,3 +67,25 @@ def test_sliced_review_iteration_diff_when_prior_given(monkeypatch):
     assert second["iteration"]["resolved"] == []
     assert second["iteration"]["newly_introduced"] == []
     assert second["iteration"]["still_present"]
+
+
+def test_sliced_review_threads_commit_range_to_each_slice(monkeypatch):
+    captured = []
+
+    def capture_review(**kw):
+        captured.append((kw.get("since_commit"), kw.get("to_commit")))
+        return {"claude_verdict": "approve", "codex_verdict": "approve",
+                "claude_findings": [], "codex_findings": [], "usage": {}}
+
+    monkeypatch.setattr(ai_chat, "_build_graph_at_branch", lambda repo, ref: _two_slice_graph())
+    monkeypatch.setattr(ai_chat, "_feature_diff_text",
+                        lambda repo, branch, base, only_globs=None, diff_spec=None: DIFF)
+
+    ai_chat.review_branch_sliced_structured(
+        repo="/x", branch="develop", base="main",
+        review_fn=capture_review, pack_target=1,
+        since_commit="AAA", to_commit="BBB")   # land in **common, then popped
+
+    assert captured, "review_fn was called per slice"
+    for since, to in captured:
+        assert since == "AAA" and to == "BBB"

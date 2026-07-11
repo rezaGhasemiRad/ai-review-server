@@ -2094,8 +2094,12 @@ def _build_graph_at_branch(repo: str, branch: str) -> dict:
     return caller_graph.build_graph(repo, branch)
 
 
-def _feature_diff_text(repo: str, branch: str, base: str, only_globs=None) -> str:
-    args = ["git", "-C", repo, "diff", f"{base}...{branch}"]
+def _feature_diff_text(repo: str, branch: str, base: str, only_globs=None,
+                       diff_spec: str | None = None) -> str:
+    # diff_spec (e.g. "since..to" or "base...branch") wins when given, so a
+    # commit-range review scopes the feature diff to exactly that range.
+    spec = diff_spec or f"{base}...{branch}"
+    args = ["git", "-C", repo, "diff", spec]
     if only_globs:
         args += ["--", *only_globs]
     return subprocess.run(args, capture_output=True, text=True,
@@ -2125,8 +2129,20 @@ def review_branch_sliced_structured(repo, branch, base="main", *,
     if pack_target is None:
         pack_target = int(slicer.MAX_REVIEW_CHARS * 0.7)
 
-    graph = _build_graph_at_branch(repo, branch)
-    diff_files = slicer.parse_unified_diff(_feature_diff_text(repo, branch, base))
+    # Commit-range scoping. Pulled from `common` (not explicit params) so the
+    # server can forward the whole review kwargs blob via **common without a
+    # duplicate-keyword collision. Threaded into BOTH the feature diff (what we
+    # slice) AND every per-slice review (so review_fn scopes its own diff to the
+    # same range — otherwise it re-derives base...branch and picks up unrelated
+    # changes to shared files).
+    since_commit = common.pop("since_commit", None)
+    to_commit = common.pop("to_commit", None)
+    narrow = common.pop("narrow_to_recent_commits", False)
+    rng = _resolve_diff_range(branch, base, since_commit, to_commit, narrow)
+
+    graph = _build_graph_at_branch(repo, rng["end"])
+    diff_files = slicer.parse_unified_diff(
+        _feature_diff_text(repo, branch, base, diff_spec=rng["diff"]))
     raw = slicer.slice_feature(graph, diff_files)
     packed = slicer.pack_slices(raw, diff_files, target=pack_target)
 
@@ -2134,10 +2150,13 @@ def review_branch_sliced_structured(repo, branch, base="main", *,
     slice_results = []
     for i, sl in enumerate(packed, 1):
         if progress_cb:
-            progress_cb(f"slice {i}/{len(packed)} ({sl.root_type}) — {len(sl.files)} files")
+            progress_cb(f"slice {i}/{len(packed)} ({sl.root_type}, {rng['kind']}) "
+                        f"— {len(sl.files)} files")
         try:
             r = review_fn(repo=repo, branch=branch, base=base,
-                          only_globs=sorted(sl.files), **common)
+                          only_globs=sorted(sl.files),
+                          since_commit=since_commit, to_commit=to_commit,
+                          narrow_to_recent_commits=narrow, **common)
         except SystemExit as e:
             raise RuntimeError(
                 f"slice {i}/{len(packed)} root={sl.root} failed: {e} "
