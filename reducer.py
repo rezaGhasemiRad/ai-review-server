@@ -22,3 +22,45 @@ def fingerprint(repo: str, finding: dict) -> str:
     category = finding.get("category") or "general"
     h = hashlib.sha1(_norm(finding.get("title", "")).encode("utf-8")).hexdigest()[:4]
     return f"{repo}:{symbol}:{category}#{h}"
+
+
+_SEV_RANK = {"bug": 0, "concern": 1, "nit": 2, "": 3}
+_VERDICT_RANK = {"request-changes": 0, "comment": 1, "approve": 2, None: 3}
+
+
+def _rollup_verdict(verdicts: list[str]) -> str:
+    present = [v for v in verdicts if v]
+    if not present:
+        return "comment"
+    return min(present, key=lambda v: _VERDICT_RANK.get(v, 3))
+
+
+def reduce(repo: str, slice_results: list[dict]) -> dict:
+    """Dedup findings by fingerprint across slices; record found_by / slices /
+    confidence; roll up the verdict (worst-of); rank by severity x confidence."""
+    merged: dict[str, dict] = {}
+    for sr in slice_results:
+        slice_name = sr.get("slice")
+        for model in ("claude", "codex"):
+            for finding in sr.get(f"{model}_findings", []) or []:
+                fp = fingerprint(repo, finding)
+                m = merged.get(fp)
+                if m is None:
+                    m = {**finding, "id": fp, "found_by": set(), "slices": set()}
+                    merged[fp] = m
+                m["found_by"].add(model)
+                m["slices"].add(slice_name)
+
+    findings = []
+    for m in merged.values():
+        m["found_by"] = sorted(m["found_by"])
+        m["slices"] = sorted(m["slices"])
+        m["confidence"] = ("high" if len(m["found_by"]) > 1 or len(m["slices"]) > 1
+                           else "low")
+        findings.append(m)
+
+    findings.sort(key=lambda x: (0 if x["confidence"] == "high" else 1,
+                                 _SEV_RANK.get(x.get("severity", ""), 3),
+                                 x["id"]))
+    return {"verdict": _rollup_verdict([sr.get("verdict") for sr in slice_results]),
+            "findings": findings}
