@@ -8,6 +8,18 @@ def test_fingerprint_is_stable_across_line_and_model_changes():
     assert reducer.fingerprint("Thabbit", a) == reducer.fingerprint("Thabbit", b)
 
 
+def test_fingerprint_handles_null_fields():
+    # A finding with file/symbol/title present-but-None (real reviewer output
+    # for a file-less finding) must not crash.
+    f = {"file": None, "symbol": None, "category": None, "title": None}
+    fp = reducer.fingerprint("Thabbit", f)
+    assert fp.startswith("Thabbit:unknown:general#")
+    # reduce() must survive such findings too.
+    out = reducer.reduce("Thabbit", [{"slice": "s1", "verdict": "comment",
+                                       "claude_findings": [f], "codex_findings": []}])
+    assert len(out["findings"]) == 1
+
+
 def test_fingerprint_differs_for_different_bug():
     a = {"file": "svc.cs", "symbol": "Foo", "category": "null-handling", "title": "X"}
     b = {"file": "svc.cs", "symbol": "Foo", "category": "auth", "title": "Y"}
