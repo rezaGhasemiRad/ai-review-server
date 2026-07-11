@@ -2120,9 +2120,11 @@ def review_branch_sliced_structured(repo, branch, base="main", *,
     """Slice an over-cap feature, review each packed slice with `review_fn`
     (default review_branch_structured) SEQUENTIALLY, and reduce to one report
     with a token ledger and (if prior_result) an iteration diff."""
+    import os
     import slicer
     import reducer
     import ledger as _ledger
+    import contract_cards
 
     review_fn = review_fn or review_branch_structured
     label = repo_label or repo.rsplit("/", 1)[-1]
@@ -2146,15 +2148,34 @@ def review_branch_sliced_structured(repo, branch, base="main", *,
     raw = slicer.slice_feature(graph, diff_files)
     packed = slicer.pack_slices(raw, diff_files, target=pack_target)
 
+    # Seam lens (Phase 3): for each slice, the callees it invokes that live in
+    # OTHER slices. Their contract cards are injected so the reviewer sees the
+    # far side of every cross-slice handoff.
+    seams_by_slice = slicer.cross_slice_callees(graph, packed)
+    # Cards live beside the symbol-graph cache. Derive the root from the same
+    # env var caller_graph uses, WITHOUT importing caller_graph (it needs
+    # tree-sitter, absent off-server).
+    _graph_cache_root = os.environ.get("GRAPH_CACHE_ROOT",
+                                       "/home/ubuntu/ai-review-server/graph-cache")
+    card_store = contract_cards.CardStore(
+        cache_path=os.path.join(_graph_cache_root, repo.rsplit("/", 1)[-1],
+                                "contract-cards.json"))
+    base_context = common.pop("context", None)
+
     L = _ledger.TokenLedger(window_budget=window_budget)
     slice_results = []
     for i, sl in enumerate(packed, 1):
         if progress_cb:
             progress_cb(f"slice {i}/{len(packed)} ({sl.root_type}, {rng['kind']}) "
                         f"— {len(sl.files)} files")
+        seam_syms = seams_by_slice.get(sl.root) or set()
+        cards = (contract_cards.cards_for_symbols(card_store, repo, rng["end"], graph, seam_syms)
+                 if seam_syms else {})
+        cards_md = contract_cards.render_cards_md(cards)
+        slice_context = "\n\n".join(x for x in (base_context, cards_md) if x) or None
         try:
             r = review_fn(repo=repo, branch=branch, base=base,
-                          only_globs=sorted(sl.files),
+                          only_globs=sorted(sl.files), context=slice_context,
                           since_commit=since_commit, to_commit=to_commit,
                           narrow_to_recent_commits=narrow, **common)
         except SystemExit as e:
@@ -2171,6 +2192,7 @@ def review_branch_sliced_structured(repo, branch, base="main", *,
             "codex_findings": r.get("codex_findings") or [],
         })
 
+    card_store.save()   # persist any cards generated this run
     reduced = reducer.reduce(label, slice_results)
     if prior_result:
         reduced["iteration"] = reducer.iteration_diff(reduced, prior_result)
