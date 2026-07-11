@@ -11,20 +11,25 @@ import argparse
 import datetime
 import fnmatch
 import json
+import os
 import pathlib
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 
 # Model-call resilience (issue #3): each claude/codex invocation is bounded
-# by a timeout and retried on transient failure.
-MODEL_CALL_TIMEOUT_S = 600   # 10 min — a single review call should never exceed this
-MODEL_CALL_RETRIES = 1       # total attempts = RETRIES + 1
+# by a timeout and retried on transient failure. A heartbeat logs progress
+# while waiting so a hung call is VISIBLE (not silently stalled) and the
+# shorter default timeout makes a stuck call self-limiting. Both env-tunable.
+MODEL_CALL_TIMEOUT_S = int(os.environ.get("MODEL_CALL_TIMEOUT_S", "420"))   # 7 min
+MODEL_CALL_RETRIES = int(os.environ.get("MODEL_CALL_RETRIES", "1"))         # attempts = RETRIES + 1
 MODEL_CALL_BACKOFF_S = 10
+MODEL_CALL_HEARTBEAT_S = int(os.environ.get("MODEL_CALL_HEARTBEAT_S", "30"))
 
 # Hard cap on diff payload — model context limits.
 MAX_REVIEW_CHARS = 1_100_000
@@ -148,6 +153,19 @@ def _run_cli(cmd: list[str], stdin_text: str, label: str) -> subprocess.Complete
     """
     last_err = "unknown error"
     for attempt in range(MODEL_CALL_RETRIES + 1):
+        # Heartbeat: a daemon thread logs elapsed time every HEARTBEAT_S while
+        # the (blocking) call runs, so a slow/hung call is visible in the log
+        # instead of a silent multi-minute stall.
+        done = threading.Event()
+
+        def _beat(lbl=label):
+            waited = 0
+            while not done.wait(MODEL_CALL_HEARTBEAT_S):
+                waited += MODEL_CALL_HEARTBEAT_S
+                info(f"… still waiting on {lbl}: {waited}s / {MODEL_CALL_TIMEOUT_S}s")
+
+        hb = threading.Thread(target=_beat, daemon=True)
+        hb.start()
         try:
             result = subprocess.run(
                 cmd, input=stdin_text, capture_output=True, text=True,
@@ -159,6 +177,8 @@ def _run_cli(cmd: list[str], stdin_text: str, label: str) -> subprocess.Complete
                         f"{(result.stderr or '').strip()[:300]}")
         except subprocess.TimeoutExpired:
             last_err = f"timed out after {MODEL_CALL_TIMEOUT_S}s"
+        finally:
+            done.set()
         if attempt < MODEL_CALL_RETRIES:
             info(f"{label} failed ({last_err}); retry in {MODEL_CALL_BACKOFF_S}s")
             time.sleep(MODEL_CALL_BACKOFF_S)
