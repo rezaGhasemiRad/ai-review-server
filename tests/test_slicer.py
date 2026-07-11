@@ -250,6 +250,34 @@ def test_sub_split_descends_when_over_cap(graph):
         "MoveQuestionsToCategoryAsync", "GetCategoryByIdAsync", "MoveQuestionsCategoryAsync"}
 
 
+def test_cross_slice_callees_none_for_independent_slices(graph):
+    # The two fixture features (endpoint path, job path) don't call each other.
+    s1 = slicer.build_slice(graph, "MoveQuestions")
+    s2 = slicer.build_slice(graph, "ExecuteAsync")
+    seams = slicer.cross_slice_callees(graph, [s1, s2])
+    assert seams["MoveQuestions"] == set()
+    assert seams["ExecuteAsync"] == set()
+
+
+def test_cross_slice_callees_detects_boundary_call():
+    # A (slice 1) calls B (owned by slice 2) -> B is a cross-slice seam of A.
+    g = {"symbol_index": {
+        "A": {"defs": [{"name": "A", "file": "a.cs", "line_start": 1, "line_end": 5,
+                        "signature": "", "enclosing_class": ""}],
+              "refs": []},
+        "B": {"defs": [{"name": "B", "file": "b.cs", "line_start": 1, "line_end": 5,
+                        "signature": "", "enclosing_class": ""}],
+              "refs": [{"name": "B", "line": 2, "ref_kind": "call", "receiver": "_x",
+                        "enclosing_function_name": "A",
+                        "enclosing_function_start": 1, "enclosing_function_end": 5}]},
+    }}
+    s_a = slicer.Slice(root="A", root_type="unknown", symbols={"A"}, files={"a.cs"})
+    s_b = slicer.Slice(root="B", root_type="unknown", symbols={"B"}, files={"b.cs"})
+    seams = slicer.cross_slice_callees(g, [s_a, s_b])
+    assert seams["A"] == {"B"}
+    assert seams["B"] == set()
+
+
 def test_slice_feature_respects_cap(graph):
     diff_files = {
         "Controllers/AdminQuestionController.cs": slicer.DiffFile(

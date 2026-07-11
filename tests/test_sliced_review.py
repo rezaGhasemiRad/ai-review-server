@@ -89,3 +89,31 @@ def test_sliced_review_threads_commit_range_to_each_slice(monkeypatch):
     assert captured, "review_fn was called per slice"
     for since, to in captured:
         assert since == "AAA" and to == "BBB"
+
+
+def test_sliced_review_injects_seam_cards(monkeypatch, tmp_path):
+    monkeypatch.setenv("GRAPH_CACHE_ROOT", str(tmp_path))
+    seen_context = []
+
+    def capture_review(**kw):
+        seen_context.append(kw.get("context") or "")
+        return {"claude_verdict": "approve", "codex_verdict": "approve",
+                "claude_findings": [], "codex_findings": [], "usage": {}}
+
+    monkeypatch.setattr(ai_chat, "_build_graph_at_branch", lambda repo, ref: _two_slice_graph())
+    monkeypatch.setattr(ai_chat, "_feature_diff_text",
+                        lambda repo, branch, base, only_globs=None, diff_spec=None: DIFF)
+    import slicer, contract_cards
+    # Force a seam + a stub card so no LLM/git is needed.
+    monkeypatch.setattr(slicer, "cross_slice_callees",
+                        lambda g, sls: {s.root: {"B"} for s in sls})
+    monkeypatch.setattr(contract_cards, "cards_for_symbols",
+                        lambda *a, **k: {"B": {"returns": "int", "null_behavior": "never",
+                                              "throws": "none", "side_effects": "writes db"}})
+
+    ai_chat.review_branch_sliced_structured(
+        repo="/x", branch="develop", base="main",
+        review_fn=capture_review, pack_target=1, context="orig")
+
+    assert any("Seam contracts" in c and "writes db" in c for c in seen_context)
+    assert all(c.startswith("orig") for c in seen_context)
