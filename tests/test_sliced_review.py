@@ -103,13 +103,15 @@ def test_sliced_review_injects_seam_cards(monkeypatch, tmp_path):
     monkeypatch.setattr(ai_chat, "_build_graph_at_branch", lambda repo, ref: _two_slice_graph())
     monkeypatch.setattr(ai_chat, "_feature_diff_text",
                         lambda repo, branch, base, only_globs=None, diff_spec=None: DIFF)
-    import slicer, contract_cards
+    import slicer, contract_cards, interslice
     # Force a seam + a stub card so no LLM/git is needed.
     monkeypatch.setattr(slicer, "cross_slice_callees",
                         lambda g, sls: {s.root: {"B"} for s in sls})
     monkeypatch.setattr(contract_cards, "cards_for_symbols",
                         lambda *a, **k: {"B": {"returns": "int", "null_behavior": "never",
                                               "throws": "none", "side_effects": "writes db"}})
+    # Isolate card-injection: no-op the inter-slice LLM pass (tested separately).
+    monkeypatch.setattr(interslice, "review_seam_edges", lambda *a, **k: [])
 
     ai_chat.review_branch_sliced_structured(
         repo="/x", branch="develop", base="main",
@@ -117,3 +119,33 @@ def test_sliced_review_injects_seam_cards(monkeypatch, tmp_path):
 
     assert any("Seam contracts" in c and "writes db" in c for c in seen_context)
     assert all(c.startswith("orig") for c in seen_context)
+
+
+def test_sliced_review_runs_interslice_and_verify(monkeypatch, tmp_path):
+    monkeypatch.setenv("GRAPH_CACHE_ROOT", str(tmp_path))
+
+    def rv(**kw):
+        return {"claude_verdict": "request-changes", "codex_verdict": "approve",
+                "claude_findings": [{"file": "svc.cs", "symbol": "A", "category": "bug",
+                                     "title": "low-conf finding", "severity": "concern"}],
+                "codex_findings": [], "usage": {}}
+
+    monkeypatch.setattr(ai_chat, "_build_graph_at_branch", lambda repo, ref: _two_slice_graph())
+    monkeypatch.setattr(ai_chat, "_feature_diff_text",
+                        lambda repo, branch, base, only_globs=None, diff_spec=None: DIFF)
+    import slicer, contract_cards, interslice, verify
+    monkeypatch.setattr(slicer, "cross_slice_callees", lambda g, sls: {s.root: {"B"} for s in sls})
+    monkeypatch.setattr(contract_cards, "cards_for_symbols", lambda *a, **k: {"B": {"returns": "int"}})
+    monkeypatch.setattr(interslice, "review_seam_edges",
+                        lambda seams, cards, **k: [{"title": "seam bug", "severity": "concern",
+                                                    "symbol": "B", "category": "seam",
+                                                    "slice": "inter-slice", "found_by": ["claude"]}])
+    monkeypatch.setattr(verify, "verify_findings",
+                        lambda findings, **k: [f for f in findings if "seam" in f.get("category", "")])
+
+    out = ai_chat.review_branch_sliced_structured(
+        repo="/x", branch="develop", base="main", review_fn=rv, pack_target=1)
+    cats = [f.get("category") for f in out["findings"]]
+    assert "seam" in cats
+    assert out.get("verification") is not None
+    assert out["verification"]["kept"] == len(out["findings"])
