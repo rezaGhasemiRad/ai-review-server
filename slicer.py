@@ -172,3 +172,41 @@ def build_slice(graph: dict, root: str, root_type: str | None = None) -> Slice:
         files |= _def_files(graph, sym)
     return Slice(root=root, root_type=root_type or classify_root(graph, root),
                  symbols=seen, files=files)
+
+
+def _root_of(graph: dict, symbol: str, _seen: set[str] | None = None) -> set[str]:
+    """Walk up to the framework-invoked root(s) that can reach `symbol`.
+    Returns the set of roots (usually one; multiple if shared code)."""
+    _seen = _seen or set()
+    if symbol in _seen:
+        return set()
+    _seen.add(symbol)
+    ups = callers(graph, symbol)
+    if not ups:
+        return {symbol}                      # symbol is itself a root
+    roots: set[str] = set()
+    for up in ups:
+        roots |= _root_of(graph, up, _seen)
+    return roots
+
+
+def slice_feature(graph: dict, diff_files: dict[str, DiffFile]) -> list[Slice]:
+    """Turn a parsed diff into vertical slices. Every changed symbol is covered
+    by at least one slice (via its root, or as its own orphan slice)."""
+    changed = changed_symbols(graph, {p: d.changed_ranges for p, d in diff_files.items()})
+
+    # 1. Roots that reach at least one changed symbol.
+    roots: set[str] = set()
+    for sym in changed:
+        roots |= _root_of(graph, sym)
+
+    slices = [build_slice(graph, r) for r in sorted(roots)]
+
+    # 2. Orphan sweep: any changed symbol not covered by a root slice becomes
+    #    its own slice (defensive — _root_of already returns the symbol itself
+    #    when it has no callers, but a cycle or missing edge could drop one).
+    covered: set[str] = set().union(*(s.symbols for s in slices)) if slices else set()
+    for sym in sorted(changed - covered):
+        slices.append(Slice(root=f"orphan::{sym}", root_type="orphan",
+                            symbols={sym}, files=_def_files(graph, sym)))
+    return slices

@@ -175,3 +175,43 @@ def test_build_slice_job_root(graph):
     s = slicer.build_slice(graph, "ExecuteAsync")
     assert s.root_type == "job"
     assert s.symbols == {"ExecuteAsync", "InsertSalesDetails", "BulkInsert"}
+
+
+def test_slice_feature_covers_all_changed_symbols_via_roots_and_orphans(graph):
+    # Change touches: the endpoint path (svc), the job path (job), and an
+    # orphan (Slugify) whose caller is not in the diff.
+    diff_files = {
+        "Services/QuestionService.cs": slicer.DiffFile(
+            "Services/QuestionService.cs", text="x" * 100, changed_ranges=[(22, 23)]),
+        "Jobs/SalesImportJob.cs": slicer.DiffFile(
+            "Jobs/SalesImportJob.cs", text="y" * 100, changed_ranges=[(18, 18)]),
+        "Util/StringHelpers.cs": slicer.DiffFile(
+            "Util/StringHelpers.cs", text="z" * 100, changed_ranges=[(6, 6)]),
+    }
+    slices = slicer.slice_feature(graph, diff_files)
+    roots = {s.root for s in slices}
+    # The changed service symbol is reached via its endpoint root, not itself.
+    assert "MoveQuestions" in roots
+    assert "ExecuteAsync" in roots
+    # Slugify is a root itself (no callers) -> its own slice.
+    assert "Slugify" in roots
+
+    # COVERAGE GUARANTEE: every changed symbol appears in at least one slice.
+    covered = set().union(*(s.symbols for s in slices))
+    changed = slicer.changed_symbols(graph, {p: d.changed_ranges
+                                             for p, d in diff_files.items()})
+    assert changed <= covered
+
+
+def test_slice_feature_orphan_when_caller_not_changed(graph):
+    # Only the leaf repo method changed; its caller (the service) is unchanged
+    # and out of the diff. It must still be covered — via its endpoint root,
+    # which is discoverable through the graph even though unchanged.
+    diff_files = {
+        "Repositories/QuestionRepository.cs": slicer.DiffFile(
+            "Repositories/QuestionRepository.cs", text="x" * 100,
+            changed_ranges=[(21, 22)]),  # MoveQuestionsCategoryAsync
+    }
+    slices = slicer.slice_feature(graph, diff_files)
+    covered = set().union(*(s.symbols for s in slices))
+    assert "MoveQuestionsCategoryAsync" in covered
