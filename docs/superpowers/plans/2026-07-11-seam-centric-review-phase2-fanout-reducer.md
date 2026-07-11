@@ -461,6 +461,8 @@ git commit -m "feat(ledger): per-stage/slice/model token accounting + render"
 
 Designed with an **injectable review function** so it unit-tests without any LLM: the default is `review_branch_structured`, tests pass a fake.
 
+**Prerequisite (do first):** `ai_chat.py` `sys.exit`s at import when `claude`/`codex` are absent, which blocks `import ai_chat` on any box without the CLIs (e.g. a dev laptop / CI). Wrap the module-level `CLAUDE_BIN = _resolve("claude")` / `CODEX_BIN = _resolve("codex")` in `try/except SystemExit` (set both to `None`), and guard `call_claude`/`call_codex` to `raise RuntimeError` if their bin is `None`. Behavior on the server (CLIs present) is unchanged. Also: the orchestrator adds a `pack_target` param (default `int(MAX_REVIEW_CHARS*0.7)`) for tuning + testability, and imports the heavy deps (`caller_graph`, `slicer`, `reducer`, `ledger`) **lazily inside the function** so `ai_chat` stays importable without tree-sitter.
+
 **Files:**
 - Modify: `ai_chat.py`
 - Create: `tests/test_sliced_review.py`
