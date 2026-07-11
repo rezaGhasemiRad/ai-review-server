@@ -77,8 +77,16 @@ def _resolve(name: str) -> str:
     return found
 
 
-CLAUDE_BIN = _resolve("claude")
-CODEX_BIN = _resolve("codex")
+# Resolve the CLIs at import, but tolerate their absence so the module can be
+# imported for its pure helpers (slicing/reduction orchestration, tests) on a
+# box without the CLIs. call_claude/call_codex raise a clear error if actually
+# invoked while unresolved. On the server both resolve normally (unchanged).
+try:
+    CLAUDE_BIN = _resolve("claude")
+    CODEX_BIN = _resolve("codex")
+except SystemExit:
+    CLAUDE_BIN = None
+    CODEX_BIN = None
 
 C = {
     "claude": "\033[36m",   # cyan
@@ -165,6 +173,8 @@ def call_claude(role: str, user_msg: str) -> tuple[str, dict]:
     usage = {input_tokens, output_tokens, usd}. Falls back to plain text
     parsing if the JSON envelope can't be read.
     """
+    if CLAUDE_BIN is None:
+        raise RuntimeError("claude CLI not found on PATH")
     cmd = [
         CLAUDE_BIN,
         "-p",
@@ -194,6 +204,8 @@ def call_codex(role: str, user_msg: str) -> tuple[str, dict]:
     parsed from the `turn.completed` event on stdout. Codex reports no
     USD (subscription), so usd stays 0.
     """
+    if CODEX_BIN is None:
+        raise RuntimeError("codex CLI not found on PATH")
     combined = f"{role}\n\n---\n\n{user_msg}"
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".txt", delete=False, encoding="utf-8"
@@ -2066,6 +2078,92 @@ def run(mode: str, seed: str, turns: int) -> None:
 
     path = save_transcript(mode, seed, history)
     info(f"transcript saved: {path}")
+
+
+# ---------------------------------------------------------------------------
+# Seam-centric sliced review (Phase 2). Slice an over-cap feature, review each
+# packed slice with the existing pipeline SEQUENTIALLY, and reduce to one
+# fingerprinted report with a token ledger. Heavy deps are imported lazily so
+# this module stays importable without tree-sitter.
+# ---------------------------------------------------------------------------
+
+def _build_graph_at_branch(repo: str, branch: str) -> dict:
+    # Phase 1 finding: build at the branch head, NOT the cached base — the
+    # feature's new code does not exist at base.
+    import caller_graph
+    return caller_graph.build_graph(repo, branch)
+
+
+def _feature_diff_text(repo: str, branch: str, base: str, only_globs=None) -> str:
+    args = ["git", "-C", repo, "diff", f"{base}...{branch}"]
+    if only_globs:
+        args += ["--", *only_globs]
+    return subprocess.run(args, capture_output=True, text=True,
+                          encoding="utf-8", check=True).stdout
+
+
+def _worst_slice_verdict(r: dict) -> str:
+    order = {"request-changes": 0, "comment": 1, "approve": 2}
+    vs = [v for v in (r.get("claude_verdict"), r.get("codex_verdict")) if v]
+    return min(vs, key=lambda v: order.get(v, 3)) if vs else "comment"
+
+
+def review_branch_sliced_structured(repo, branch, base="main", *,
+                                    review_fn=None, repo_label=None,
+                                    prior_result=None, progress_cb=None,
+                                    window_budget=0,
+                                    pack_target=None, **common):
+    """Slice an over-cap feature, review each packed slice with `review_fn`
+    (default review_branch_structured) SEQUENTIALLY, and reduce to one report
+    with a token ledger and (if prior_result) an iteration diff."""
+    import slicer
+    import reducer
+    import ledger as _ledger
+
+    review_fn = review_fn or review_branch_structured
+    label = repo_label or repo.rsplit("/", 1)[-1]
+    if pack_target is None:
+        pack_target = int(slicer.MAX_REVIEW_CHARS * 0.7)
+
+    graph = _build_graph_at_branch(repo, branch)
+    diff_files = slicer.parse_unified_diff(_feature_diff_text(repo, branch, base))
+    raw = slicer.slice_feature(graph, diff_files)
+    packed = slicer.pack_slices(raw, diff_files, target=pack_target)
+
+    L = _ledger.TokenLedger(window_budget=window_budget)
+    slice_results = []
+    for i, sl in enumerate(packed, 1):
+        if progress_cb:
+            progress_cb(f"slice {i}/{len(packed)} ({sl.root_type}) — {len(sl.files)} files")
+        try:
+            r = review_fn(repo=repo, branch=branch, base=base,
+                          only_globs=sorted(sl.files), **common)
+        except SystemExit as e:
+            raise RuntimeError(
+                f"slice {i}/{len(packed)} root={sl.root} failed: {e} "
+                f"[tokens so far: {L.total_tokens():,}]") from e
+        usage = r.get("usage") or {}
+        for model in ("claude", "codex"):
+            L.add(sl.root, model, "review", usage.get(model, {}))
+        slice_results.append({
+            "slice": sl.root,
+            "verdict": _worst_slice_verdict(r),
+            "claude_findings": r.get("claude_findings") or [],
+            "codex_findings": r.get("codex_findings") or [],
+        })
+
+    reduced = reducer.reduce(label, slice_results)
+    if prior_result:
+        reduced["iteration"] = reducer.iteration_diff(reduced, prior_result)
+    reduced["slice_count"] = len(packed)
+    reduced["token_ledger"] = {
+        "total_tokens": L.total_tokens(),
+        "by_model": L.by_model(), "by_slice": L.by_slice(), "by_phase": L.by_phase(),
+        "pct_of_window": L.pct_of_window(), "render": L.render(),
+    }
+    if progress_cb:
+        progress_cb(L.render())
+    return reduced
 
 
 def main() -> None:
