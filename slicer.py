@@ -210,6 +210,25 @@ def sub_split(graph: dict, slc: Slice, diff_files: dict[str, DiffFile],
     return out
 
 
+def cross_slice_callees(graph: dict, slices: list[Slice]) -> dict[str, set[str]]:
+    """For each slice, the callee symbols it invokes that are defined in a
+    DIFFERENT slice (its cross-slice seams). Symbols not owned by any slice are
+    ignored (they're context, not seams)."""
+    owner: dict[str, str] = {}
+    for s in slices:
+        for sym in s.symbols:
+            owner.setdefault(sym, s.root)
+    out: dict[str, set[str]] = {}
+    for s in slices:
+        seam: set[str] = set()
+        for sym in s.symbols:
+            for callee in callees(graph, sym):
+                if owner.get(callee) not in (None, s.root):
+                    seam.add(callee)
+        out[s.root] = seam
+    return out
+
+
 def pack_slices(slices: list[Slice], diff_files: dict[str, DiffFile],
                 target: int = int(MAX_REVIEW_CHARS * 0.7)) -> list[Slice]:
     """First-fit-decreasing bin-pack: merge slices whose combined changed-file
