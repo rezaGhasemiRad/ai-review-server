@@ -152,3 +152,26 @@ def test_is_root_true_for_framework_invoked(graph):
     assert slicer.is_root(graph, "ExecuteAsync") is True       # job
     assert slicer.is_root(graph, "Slugify") is True            # orphan (no callers)
     assert slicer.is_root(graph, "MoveQuestionsToCategoryAsync") is False
+
+
+def test_classify_root_from_signature(graph):
+    assert slicer.classify_root(graph, "MoveQuestions") == "endpoint"
+    assert slicer.classify_root(graph, "ExecuteAsync") == "job"
+    assert slicer.classify_root(graph, "Slugify") == "unknown"
+
+
+def test_build_slice_collects_vertical_path(graph):
+    s = slicer.build_slice(graph, "MoveQuestions")
+    assert s.root == "MoveQuestions"
+    assert s.root_type == "endpoint"
+    assert s.symbols == {"MoveQuestions", "MoveQuestionsToCategoryAsync",
+                         "GetCategoryByIdAsync", "MoveQuestionsCategoryAsync"}
+    assert s.files == {"Controllers/AdminQuestionController.cs",
+                       "Services/QuestionService.cs",
+                       "Repositories/QuestionRepository.cs"}
+
+
+def test_build_slice_job_root(graph):
+    s = slicer.build_slice(graph, "ExecuteAsync")
+    assert s.root_type == "job"
+    assert s.symbols == {"ExecuteAsync", "InsertSalesDetails", "BulkInsert"}

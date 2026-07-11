@@ -128,3 +128,47 @@ def callers(graph: dict, symbol: str) -> set[str]:
 def is_root(graph: dict, symbol: str) -> bool:
     """A symbol with no in-repo callers (framework/runtime-invoked, or orphan)."""
     return len(callers(graph, symbol)) == 0
+
+
+# v1 classification: match recognizable C# markers in the def signature and
+# enclosing class declaration. Best-effort labels for report legibility;
+# type-specific checklists are deferred to a later phase.
+_ENDPOINT_MARKERS = ("[HttpGet", "[HttpPost", "[HttpPut", "[HttpDelete",
+                     "[HttpPatch", "[Route", "[ApiController", ": ControllerBase",
+                     ": Controller")
+_HUB_MARKERS = (": Hub", ": Hub<")
+_JOB_MARKERS = (": BackgroundService", "IHostedService", "IJob")
+
+
+def classify_root(graph: dict, symbol: str) -> str:
+    defs = (graph.get("symbol_index") or {}).get(symbol, {}).get("defs", [])
+    sig = " ".join(d.get("signature", "") for d in defs)
+    if any(m in sig for m in _JOB_MARKERS):
+        return "job"
+    if any(m in sig for m in _HUB_MARKERS):
+        return "hub"
+    if any(m in sig for m in _ENDPOINT_MARKERS):
+        return "endpoint"
+    return "unknown"
+
+
+def _def_files(graph: dict, symbol: str) -> set[str]:
+    return {d["file"] for d in (graph.get("symbol_index") or {}).get(symbol, {}).get("defs", [])}
+
+
+def build_slice(graph: dict, root: str, root_type: str | None = None) -> Slice:
+    """DFS down from `root` over callees, collecting all reachable symbols and
+    the files that define them."""
+    seen: set[str] = set()
+    stack = [root]
+    while stack:
+        sym = stack.pop()
+        if sym in seen:
+            continue
+        seen.add(sym)
+        stack.extend(callees(graph, sym) - seen)
+    files: set[str] = set()
+    for sym in seen:
+        files |= _def_files(graph, sym)
+    return Slice(root=root, root_type=root_type or classify_root(graph, root),
+                 symbols=seen, files=files)
