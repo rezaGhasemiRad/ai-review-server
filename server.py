@@ -43,6 +43,7 @@ import urllib.parse
 import urllib.request
 
 import ai_chat  # the structured review function lives here
+import slice_routing  # over-cap -> sliced review routing decision
 
 log = logging.getLogger("review_server")
 
@@ -998,13 +999,32 @@ def _run_job(job_id: str) -> None:
 
         if len(prepared) == 1:
             p = prepared[0]
-            result = ai_chat.review_branch_structured(
-                repo=p["repo"], branch=p["branch"], base=p["base"], **common,
-            )
+            if slice_routing.should_slice(req, p["repo"], p["branch"], p["base"],
+                                          ai_chat.MAX_REVIEW_CHARS):
+                progress("feature over cap — slicing for cross-model review")
+                # The orchestrator sets only_globs per slice and drives prior/
+                # progress itself, so strip those from the forwarded kwargs to
+                # avoid duplicate-keyword collisions.
+                sliced_common = {k: v for k, v in common.items()
+                                 if k not in ("only_globs", "prior_result", "progress_cb")}
+                result = ai_chat.review_branch_sliced_structured(
+                    repo=p["repo"], branch=p["branch"], base=p["base"],
+                    repo_label=_short_repo(p["repo_url"]),
+                    prior_result=prior_result, progress_cb=progress,
+                    window_budget=OPUS_5H_TOKEN_BUDGET,
+                    **sliced_common,
+                )
+            else:
+                result = ai_chat.review_branch_structured(
+                    repo=p["repo"], branch=p["branch"], base=p["base"], **common,
+                )
         else:
             result = ai_chat.review_multi_repo_structured(
                 repos=prepared, **common,
             )
+        if isinstance(result, dict) and result.get("token_ledger"):
+            log.info("job %s token ledger: %s", job_id,
+                     result["token_ledger"].get("render", ""))
 
         if test_results_by_repo:
             result["test_results"] = test_results_by_repo

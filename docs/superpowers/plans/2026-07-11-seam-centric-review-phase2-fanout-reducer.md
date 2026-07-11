@@ -620,9 +620,11 @@ git commit -m "feat(ai_chat): review_branch_sliced_structured (slice->review->re
 
 ## Task 7: Route `server._run_job` to the sliced path
 
+**Deviations from the draft below (as built):** `import server` fails off-server (needs FastAPI + `REVIEW_SERVER_API_KEY`), so the routing decision lives in a standalone **`slice_routing.py`** (`feature_diff_size`, `should_slice(req, repo, branch, base, cap)`) tested via `tests/test_slice_routing.py` — no server import. `server._run_job` calls `slice_routing.should_slice(..., ai_chat.MAX_REVIEW_CHARS)`. Also, the sliced call must strip **`only_globs`, `prior_result`, and `progress_cb`** from the forwarded `common` (the orchestrator sets `only_globs` per slice and drives prior/progress itself) — passing them via `**common` collides with the explicit kwargs. Server syntax verified with `python -m py_compile server.py` (can't import locally).
+
 **Files:**
-- Modify: `server.py:999-1007` (the single-repo branch of `_run_job`)
-- Modify: `tests/test_sliced_review.py` (add a routing unit test around a small helper)
+- Create: `slice_routing.py` + `tests/test_slice_routing.py`
+- Modify: `server.py` (import `slice_routing`; route the single-repo branch of `_run_job`; log the token ledger)
 
 - [ ] **Step 1: Write the failing test for a routing helper**
 
