@@ -65,8 +65,16 @@ def reduce(repo: str, slice_results: list[dict]) -> dict:
     findings.sort(key=lambda x: (0 if x["confidence"] == "high" else 1,
                                  _SEV_RANK.get(x.get("severity", ""), 3),
                                  x["id"]))
+    # Back-compat with the UI/API, which render per-model columns: split the
+    # merged findings by `found_by` (a finding flagged by both appears in both,
+    # exactly like the single-review pipeline). Keep merged `findings` too.
+    claude_findings = [f for f in findings if "claude" in f["found_by"]]
+    codex_findings = [f for f in findings if "codex" in f["found_by"]]
     return {"verdict": _rollup_verdict([sr.get("verdict") for sr in slice_results]),
-            "findings": findings}
+            "findings": findings,
+            "claude_findings": claude_findings,
+            "codex_findings": codex_findings,
+            "reviewers": ["claude", "codex"]}
 
 
 def iteration_diff(current: dict, prior: dict | None) -> dict:

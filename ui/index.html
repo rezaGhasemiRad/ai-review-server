@@ -848,6 +848,22 @@ async function loadDetail(){
     } catch(e){ /* untagged or solo iteration — silent */ }
   }
 
+  // sliced review summary (Phase 2): slice count + token ledger. Only present
+  // on results produced by the sliced/fan-out pipeline.
+  if(r.slice_count != null){
+    const tl = r.token_ledger || {};
+    const bm = tl.by_model || {};
+    const num = n => Number(n).toLocaleString();
+    h += '<div class="card"><h3 style="margin:0 0 8px">Sliced review</h3>'+
+      '<div class="muted">'+r.slice_count+' slice(s)'+
+      (tl.total_tokens!=null? ' · '+num(tl.total_tokens)+' tokens':'')+
+      (tl.pct_of_window!=null? ' · '+Number(tl.pct_of_window).toFixed(1)+'% of 5h window':'')+
+      '</div>'+
+      (Object.keys(bm).length? '<div class="muted" style="margin-top:4px">'+
+         Object.entries(bm).map(([k,v])=>esc(k)+'='+num(v)).join(' · ')+'</div>':'')+
+      '</div>';
+  }
+
   // findings — each finding is followed by the OTHER reviewer's stance
   // (agree/disagree/unsure + one-line note) when reconcile produced a
   // peer_assessment array. r.codex_peer_assessment is Codex's stance on
@@ -895,7 +911,9 @@ async function loadDetail(){
     ['codex','Codex — Reconciliation', r.codex_reconcile],
   ];
   for(const [who,title,txt] of blocks){
-    if(txt===undefined && j.status!=='complete') continue;
+    // Sliced results carry no per-model prose; skip the empty blocks instead
+    // of rendering four "(none)" boxes.
+    if(txt===undefined && (j.status!=='complete' || r.slice_count!=null)) continue;
     h += '<div class="review '+who+'"><h3>'+title+'</h3>'+
          '<div class="body md">'+renderMd(txt)+'</div></div>';
   }
