@@ -99,7 +99,6 @@ def pack_slices(slices: list[Slice], diff_files: dict[str, DiffFile],
                 if b.root_type != "packed":
                     b.root = f"packed::{b.root}"
                     b.root_type = "packed"
-                b.symbols.add(s.root)
                 placed = True
                 break
         if not placed:

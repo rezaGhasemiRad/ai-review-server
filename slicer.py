@@ -210,6 +210,34 @@ def sub_split(graph: dict, slc: Slice, diff_files: dict[str, DiffFile],
     return out
 
 
+def pack_slices(slices: list[Slice], diff_files: dict[str, DiffFile],
+                target: int = int(MAX_REVIEW_CHARS * 0.7)) -> list[Slice]:
+    """First-fit-decreasing bin-pack: merge slices whose combined changed-file
+    size stays <= target, to minimize review count. A slice already over
+    target is emitted alone (sub_split should have handled true over-cap).
+    Coverage is preserved (union of symbols/files is unchanged). Merged slices
+    are labeled root_type='packed'."""
+    ordered = sorted(slices, key=lambda s: slice_char_size(s, diff_files), reverse=True)
+    bins: list[Slice] = []
+    for s in ordered:
+        placed = False
+        for b in bins:
+            merged_files = b.files | s.files
+            size = sum(diff_files[p].char_count for p in merged_files if p in diff_files)
+            if size <= target:
+                b.files = merged_files
+                b.symbols |= s.symbols
+                if b.root_type != "packed":
+                    b.root = f"packed::{b.root}"
+                    b.root_type = "packed"
+                placed = True
+                break
+        if not placed:
+            bins.append(Slice(root=s.root, root_type=s.root_type,
+                             symbols=set(s.symbols), files=set(s.files)))
+    return bins
+
+
 def _root_of(graph: dict, symbol: str, _seen: set[str] | None = None) -> set[str]:
     """Walk up to the framework-invoked root(s) that can reach `symbol`.
     Returns the set of roots (usually one; multiple if shared code)."""
