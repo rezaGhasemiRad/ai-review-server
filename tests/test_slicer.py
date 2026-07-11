@@ -118,3 +118,19 @@ def test_parse_unified_diff_extracts_files_ranges_and_text():
     assert svc.char_count == len(svc.text) > 0
     repo = parsed["Repositories/QuestionRepository.cs"]
     assert repo.changed_ranges == [(21, 22)]
+
+
+def test_changed_symbols_maps_ranges_to_enclosing_defs(graph):
+    # A change at lines 22-23 of QuestionService is inside
+    # MoveQuestionsToCategoryAsync (L10-30).
+    changed = {"Services/QuestionService.cs": [(22, 23)]}
+    assert slicer.changed_symbols(graph, changed) == {"MoveQuestionsToCategoryAsync"}
+
+
+def test_changed_symbols_multiple_files_and_defs(graph):
+    changed = {
+        "Repositories/QuestionRepository.cs": [(12, 12), (25, 25)],  # both repo methods
+        "Util/StringHelpers.cs": [(6, 6)],                            # Slugify
+    }
+    assert slicer.changed_symbols(graph, changed) == {
+        "GetCategoryByIdAsync", "MoveQuestionsCategoryAsync", "Slugify"}

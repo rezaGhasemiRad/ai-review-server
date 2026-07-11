@@ -74,3 +74,23 @@ def parse_unified_diff(diff_text: str) -> dict[str, DiffFile]:
             end = start + max(length, 1) - 1
             current.changed_ranges.append((start, end))
     return files
+
+
+def _overlaps(a: tuple[int, int], b: tuple[int, int]) -> bool:
+    return a[0] <= b[1] and b[0] <= a[1]
+
+
+def changed_symbols(graph: dict, changed: dict[str, list[tuple[int, int]]]) -> set[str]:
+    """Names of definitions whose [line_start, line_end] intersects a changed
+    range in the same file."""
+    out: set[str] = set()
+    files = graph.get("files") or {}
+    for path, ranges in changed.items():
+        fdata = files.get(path)
+        if not fdata:
+            continue
+        for de in fdata.get("defs", []):
+            span = (de["line_start"], de["line_end"])
+            if any(_overlaps(span, rng) for rng in ranges):
+                out.add(de["name"])
+    return out
