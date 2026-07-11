@@ -910,6 +910,16 @@ git commit -m "test(slicer): Quick Duel end-to-end coverage + cap validation"
 - On the server, `test_slicer_quickduel.py` shows Quick Duel splitting into N slices, each ≤ `MAX_REVIEW_CHARS`, with 100% changed-symbol coverage.
 - `slicer.py` exposes: `parse_unified_diff`, `changed_symbols`, `callees`, `callers`, `is_root`, `classify_root`, `build_slice`, `slice_feature`, `slice_char_size`, `sub_split`, and the `Slice` / `DiffFile` dataclasses — the surface Phase 2 (pipeline wiring) will call.
 
+## Findings from the Quick Duel validation (2026-07-11)
+
+Real-data validation on the review server surfaced two things that shape Phase 2:
+
+1. **The graph MUST be built at the feature branch head, not the base.** The cached graph was at `origin/main` (pre-Quick-Duel), so the feature's ~150 new files were absent and coverage was vacuous (only 27 pre-existing modified symbols mapped). Rebuilt at `origin/develop` (807 files / 3401 symbols): **655 changed symbols, 655 covered, 0 missing, all 966 slices under the 1.1M cap.** Phase 2 must build/refresh the graph at the branch being reviewed. The integration test now calls `build_graph(REPO, BRANCH)` and guards with `len(changed) > 100` to catch a wrong-ref regression.
+
+2. **Slice count needs bin-packing in Phase 2.** The slicer produced **966 slices** (largest 335K chars) — correct (100% coverage, all under cap) but far from the "~6 reviewable chunks" vision. Many changed DTOs/models/enums have no in-repo callers → each becomes its own root/orphan slice. Phase 2 needs a **packing step**: merge small sibling slices up to the cap to minimize the review count (and thus fan-out cost). Slice *correctness* is done here; slice *economy* is Phase 2.
+
+**Validation note:** the prod venv has no `pytest`, so `test_slicer_quickduel.py`'s logic was validated via an equivalent standalone runner using the server venv Python (`build_graph` at branch + `slice_feature` + the same assertions). Locally the test skips (no tree-sitter).
+
 ## Handoff to Phase 2 (separate plan)
 
-Phase 2 wires `slice_feature` into the review pipeline: for each `Slice`, run the existing Claude+Codex review over the slice's changed files, then feed results into the (also-new) reducer. That plan will be written after Phase 1 lands and the Quick Duel numbers are confirmed.
+Phase 2 wires `slice_feature` into the review pipeline: build the graph **at the branch head**, **pack** slices up to the cap, then for each packed `Slice` run the existing Claude+Codex review over the slice's changed files, and feed results into the (also-new) reducer. Written after Phase 1 lands (now) and the Quick Duel numbers are confirmed (done: 655 symbols → 966 slices, all under cap).
