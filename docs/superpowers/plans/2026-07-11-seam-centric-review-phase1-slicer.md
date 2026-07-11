@@ -63,10 +63,12 @@ import dataclasses
 import re
 
 # Keep in sync with ai_chat.MAX_REVIEW_CHARS (mixed Claude+Codex cap).
-# Imported lazily so the slicer stays unit-testable standalone.
+# Imported lazily so the slicer stays unit-testable standalone. ai_chat.py
+# calls sys.exit() at import when the claude/codex CLIs are absent, and
+# SystemExit is NOT an Exception subclass — so catch it too.
 try:
     from ai_chat import MAX_REVIEW_CHARS
-except Exception:  # pragma: no cover - fallback for isolated tests
+except (Exception, SystemExit):  # pragma: no cover - fallback for isolated tests
     MAX_REVIEW_CHARS = 1_100_000
 
 
