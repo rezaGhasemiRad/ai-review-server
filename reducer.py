@@ -64,3 +64,14 @@ def reduce(repo: str, slice_results: list[dict]) -> dict:
                                  x["id"]))
     return {"verdict": _rollup_verdict([sr.get("verdict") for sr in slice_results]),
             "findings": findings}
+
+
+def iteration_diff(current: dict, prior: dict | None) -> dict:
+    """Classify current findings against a prior reduced report by fingerprint."""
+    cur = {f["id"] for f in current.get("findings", [])}
+    old = {f["id"] for f in (prior or {}).get("findings", [])}
+    return {
+        "still_present": sorted(cur & old),
+        "resolved": sorted(old - cur),
+        "newly_introduced": sorted(cur - old),
+    }

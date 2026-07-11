@@ -42,3 +42,12 @@ def test_reduce_dedups_and_records_provenance_and_rolls_up_verdict():
     assert guid[0]["confidence"] == "high"        # both models
     # Ranked: high-confidence first.
     assert out["findings"][0]["category"] == "null-handling"
+
+
+def test_iteration_diff_classifies_by_fingerprint():
+    prior = {"findings": [{"id": "R:Foo:null#aaaa"}, {"id": "R:Bar:auth#bbbb"}]}
+    current = {"findings": [{"id": "R:Foo:null#aaaa"}, {"id": "R:Baz:perf#cccc"}]}
+    d = reducer.iteration_diff(current, prior)
+    assert d["still_present"] == ["R:Foo:null#aaaa"]
+    assert d["resolved"] == ["R:Bar:auth#bbbb"]
+    assert d["newly_introduced"] == ["R:Baz:perf#cccc"]
